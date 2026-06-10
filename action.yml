@@ -10,8 +10,12 @@ inputs:
     description: 'Ducky API key. Store it as a repo secret (e.g. DUCKY_API_KEY) and pass it via this input.'
     required: true
   url:
-    description: 'The deployed URL to render the demo against (e.g. your preview or prod URL).'
-    required: true
+    description: 'The deployed URL to render the demo against. Optional — when omitted, Ducky waits for this commit''s deployment (e.g. a Vercel/Netlify preview) and uses its URL.'
+    required: false
+  wait-timeout:
+    description: 'Seconds to wait for the deployment when url is omitted.'
+    required: false
+    default: '300'
   task:
     description: 'What to demonstrate, e.g. "Show the new checkout flow". Optional — when omitted, Ducky reads the PR (title, description, diff) and derives what to demo.'
     required: false
@@ -33,6 +37,7 @@ runs:
         RENDER_URL: ${{ inputs.url }}
         RENDER_TASK: ${{ inputs.task }}
         RENDER_REEL: ${{ inputs.reel }}
+        WAIT_TIMEOUT: ${{ inputs.wait-timeout }}
         DUCKY_API_BASE: ${{ inputs.api-base }}
         PR_NUMBER: ${{ github.event.pull_request.number || github.event.number }}
         GH_TOKEN: ${{ github.token }}

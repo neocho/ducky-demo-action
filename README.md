@@ -15,7 +15,8 @@ on:
   pull_request:
 
 permissions:
-  contents: read      # read the PR diff (to derive what to demo)
+  contents: read       # read the PR diff (to derive what to demo)
+  deployments: read    # find the PR's preview deployment
   pull-requests: write # post the demo comment
 
 jobs:
@@ -24,20 +25,50 @@ jobs:
     steps:
       - uses: neocho/ducky-demo-action@v1
         with:
-          url: https://your-app.example.com
           api-key: ${{ secrets.DUCKY_API_KEY }}
 ```
 
-Open a pull request — Ducky reads it, decides what to demo, and posts the video on it. If a PR has nothing user-visible to show (a refactor, CI change, docs), Ducky skips it quietly.
+Open a pull request — Ducky waits for the PR's preview deployment, reads the PR to decide what to demo, renders it, and posts the video. If a PR has nothing user-visible to show (a refactor, CI change, docs), Ducky skips it quietly.
+
+> The no-`url` setup works when your host deploys previews through GitHub (Vercel, Netlify, Render, …). Deploy some other way? See the recipes below.
+
+## Pointing Ducky at the right URL
+
+The demo is only as good as the URL it renders. Three setups:
+
+**1. Your host builds a preview per PR (Vercel, Netlify, Render, …)** — omit `url` (the Quick start above). Ducky polls GitHub until the preview deployment for the PR's commit succeeds and renders that preview, so the demo shows the PR's actual change. Tune the wait with `wait-timeout` (default 300s).
+
+**2. You deploy from your own workflow** — put the Ducky step after your deploy step and pass the URL you deployed:
+
+```yaml
+      - run: ./deploy.sh                       # your existing deploy
+      # if your deploy command returns before the new version is live,
+      # add your host's wait command here (e.g. aws ecs wait services-stable)
+      - uses: neocho/ducky-demo-action@v1
+        with:
+          url: https://staging.your-app.example.com
+          api-key: ${{ secrets.DUCKY_API_KEY }}
+```
+
+**3. You only deploy production, on merge** — trigger on push to your main branch instead. Ducky finds the merged PR from the commit and posts the demo there after the deploy:
+
+```yaml
+on:
+  push:
+    branches: [main]
+```
+
+(Don't point a `pull_request`-triggered run at prod — prod doesn't have the PR's change yet, so the demo would show the old version.)
 
 ## Inputs
 
 | Input | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `url` | Yes | — | The deployed URL to demo. |
 | `api-key` | Yes | — | Your Ducky API key (use a repository secret). |
+| `url` | No | the PR's preview deployment | The deployed URL to demo. When omitted, Ducky waits for this commit's deployment via GitHub and uses its URL. |
 | `task` | No | derived from the PR | Force what to show, e.g. `"Sign up for a new account"`. When omitted, Ducky derives it from the PR's title, description, and diff. |
 | `reel` | No | `true` | Post the polished narrated reel, or the raw screen recording. |
+| `wait-timeout` | No | `300` | Seconds to wait for the deployment when `url` is omitted. |
 
 ## Get a key
 
