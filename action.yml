@@ -1,0 +1,40 @@
+name: 'Ducky Demo'
+description: 'Render an auto-generated demo video of your deployed app and post it as a PR comment.'
+author: 'Ducky'
+branding:
+  icon: 'video'
+  color: 'yellow'
+
+inputs:
+  api-key:
+    description: 'Ducky API key. Store it as a repo secret (e.g. DUCKY_API_KEY) and pass it via this input.'
+    required: true
+  url:
+    description: 'The deployed URL to render the demo against (e.g. your preview or prod URL).'
+    required: true
+  task:
+    description: 'What to demonstrate, e.g. "Show the new checkout flow". (Auto-derivation from the PR is coming.)'
+    required: true
+  reel:
+    description: 'Produce the polished narrated reel (true) or just the raw demo (false).'
+    required: false
+    default: 'true'
+  api-base:
+    description: 'Ducky API base URL.'
+    required: false
+    default: 'https://api.tryducky.dev'
+
+runs:
+  using: 'composite'
+  steps:
+    - shell: bash
+      env:
+        DUCKY_API_KEY: ${{ inputs.api-key }}
+        RENDER_URL: ${{ inputs.url }}
+        RENDER_TASK: ${{ inputs.task }}
+        RENDER_REEL: ${{ inputs.reel }}
+        DUCKY_API_BASE: ${{ inputs.api-base }}
+        PR_NUMBER: ${{ github.event.pull_request.number || github.event.number }}
+        GH_TOKEN: ${{ github.token }}
+        GH_REPO: ${{ github.repository }}
+      run: node "${{ github.action_path }}/index.mjs"
