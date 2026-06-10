@@ -24,19 +24,18 @@ jobs:
       - uses: neocho/ducky-demo-action@v1
         with:
           url: https://your-app.example.com
-          task: "Show the new checkout flow"
           api-key: ${{ secrets.DUCKY_API_KEY }}
 ```
 
-Open a pull request — Ducky posts the demo on it.
+Open a pull request — Ducky reads it, decides what to demo, and posts the video on it. If a PR has nothing user-visible to show (a refactor, CI change, docs), Ducky skips it quietly.
 
 ## Inputs
 
 | Input | Required | Default | Description |
 |-------|----------|---------|-------------|
 | `url` | Yes | — | The deployed URL to demo. |
-| `task` | Yes | — | What to show, e.g. `"Sign up for a new account"`. |
 | `api-key` | Yes | — | Your Ducky API key (use a repository secret). |
+| `task` | No | derived from the PR | Force what to show, e.g. `"Sign up for a new account"`. When omitted, Ducky derives it from the PR's title, description, and diff. |
 | `reel` | No | `true` | Post the polished narrated reel, or the raw screen recording. |
 
 ## Get a key

@@ -1,19 +1,21 @@
-// Ducky Demo Action runtime (Flow A — the MVP trigger).
+// Ducky Demo Action runtime.
 //
 // Reads inputs from env (mapped by action.yml), renders a demo via the Ducky
-// API, and posts the video as a PR comment. Productized from the de-risked loop
-// in tmp/spikes/flow-a-action-spike/run.mjs — MINUS the derive step (step 1 uses
-// a configured `task` input; auto-derivation from the PR diff is step 2).
+// API, and posts the video as a PR comment. When no `task` input is set, the
+// PR's title/body/diff are sent to Ducky, which derives what to demo — or says
+// there's nothing user-visible to show, in which case the run skips cleanly.
 //
 // Zero deps: node20 global fetch + the GitHub REST API. The PR comment is posted
 // with a JSON body (NOT shell-interpolated) so backticks/newlines aren't mangled.
+
+import { readFileSync } from "node:fs";
 
 const env = process.env;
 const fail = (msg) => { console.log(`::error::Ducky: ${msg}`); process.exit(1); };
 
 const KEY = env.DUCKY_API_KEY;
 const URL_ = env.RENDER_URL;
-const TASK = env.RENDER_TASK;
+let TASK = env.RENDER_TASK;
 const REEL = env.RENDER_REEL !== "false"; // default true
 const API = (env.DUCKY_API_BASE || "https://api.tryducky.dev").replace(/\/+$/, "");
 const PR = env.PR_NUMBER;
@@ -27,11 +29,53 @@ const TERMINAL = [...DONE, "failed", "error", "cancelled"];
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// No `task` input → derive one from the PR. Title/body come free from the
+// event payload on disk; the diff is one GitHub API call. Ducky's server
+// decides whether the change is user-visible — if not, skip cleanly (exit 0,
+// no render, no comment).
+async function deriveTask() {
+  let title, body;
+  try {
+    const event = JSON.parse(readFileSync(env.GITHUB_EVENT_PATH, "utf8"));
+    title = event.pull_request?.title;
+    body = event.pull_request?.body || undefined;
+  } catch {
+    /* fall through to the title check */
+  }
+  if (!title) fail("no task input and no PR in the event payload — set `task`, or run on a pull_request event.");
+
+  const diffRes = await fetch(`https://api.github.com/repos/${REPO}/pulls/${PR}`, {
+    headers: {
+      Authorization: `Bearer ${GH_TOKEN}`,
+      Accept: "application/vnd.github.diff",
+      "X-GitHub-Api-Version": "2022-11-28",
+    },
+  });
+  if (!diffRes.ok) fail(`fetching the PR diff failed (${diffRes.status})`);
+  const diff = (await diffRes.text()).slice(0, 6_000);
+
+  console.log("Ducky: no task set — deriving one from the PR");
+  const res = await fetch(`${API}/v1/derive`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+    body: JSON.stringify({ title: title.slice(0, 300), body: body?.slice(0, 10_000), diff, url: URL_ }),
+  });
+  if (!res.ok) fail(`task derivation failed (${res.status}): ${(await res.text()).slice(0, 300)}`);
+  const verdict = await res.json();
+  if (!verdict.demoable) {
+    console.log(`Ducky: nothing user-visible to demo in this PR — skipping. (${verdict.reason ?? "no reason given"})`);
+    process.exit(0);
+  }
+  console.log(`Ducky: derived task — ${verdict.task}`);
+  return verdict.task;
+}
+
 async function main() {
-  for (const [k, v] of [["api-key", KEY], ["url", URL_], ["task", TASK]]) {
+  for (const [k, v] of [["api-key", KEY], ["url", URL_]]) {
     if (!v) fail(`missing required input: ${k}`);
   }
   if (!PR) fail("no pull request in context — run this action on a PR event so it can comment.");
+  if (!TASK) TASK = await deriveTask();
 
   // 1) submit the render
   console.log(`Ducky: rendering ${URL_}`);
