@@ -15,7 +15,8 @@ on:
   pull_request:
 
 permissions:
-  pull-requests: write
+  contents: read      # read the PR diff (to derive what to demo)
+  pull-requests: write # post the demo comment
 
 jobs:
   demo:
