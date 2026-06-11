@@ -22,6 +22,12 @@ const KEY = env.DUCKY_API_KEY;
 let URL_ = env.RENDER_URL;
 let TASK = env.RENDER_TASK;
 const REEL = env.RENDER_REEL !== "false"; // default true
+// T-082 app-login: labels of stored credentials (never the secrets) + the
+// custom login-path hints — forwarded verbatim to the render.
+const CREDENTIAL = env.RENDER_CREDENTIAL || undefined;
+const VERCEL_BYPASS = env.RENDER_VERCEL_BYPASS || undefined;
+const LOGIN_HINTS = (env.RENDER_LOGIN_HINTS || "")
+  .split(",").map((h) => h.trim()).filter(Boolean);
 const API = (env.DUCKY_API_BASE || "https://api.tryducky.dev").replace(/\/+$/, "");
 let PR = env.PR_NUMBER;
 const GH_TOKEN = env.GH_TOKEN;
@@ -144,7 +150,12 @@ async function main() {
   const subRes = await fetch(`${API}/v1/renders`, {
     method: "POST",
     headers: { Authorization: `Bearer ${KEY}`, "content-type": "application/json" },
-    body: JSON.stringify({ url: URL_, task: TASK, reel: REEL, source: "github_pr" }),
+    body: JSON.stringify({
+      url: URL_, task: TASK, reel: REEL, source: "github_pr",
+      ...(CREDENTIAL ? { credential: CREDENTIAL } : {}),
+      ...(VERCEL_BYPASS ? { vercel_bypass: VERCEL_BYPASS } : {}),
+      ...(LOGIN_HINTS.length ? { login_hints: LOGIN_HINTS } : {}),
+    }),
   });
   if (!subRes.ok) fail(`render submit failed (${subRes.status}): ${(await subRes.text()).slice(0, 300)}`);
   const sub = await subRes.json();

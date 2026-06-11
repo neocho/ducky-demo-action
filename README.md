@@ -69,6 +69,23 @@ on:
 | `task` | No | derived from the PR | Force what to show, e.g. `"Sign up for a new account"`. When omitted, Ducky derives it from the PR's title, description, and diff. |
 | `reel` | No | `true` | Post the polished narrated reel, or the raw screen recording. |
 | `wait-timeout` | No | `300` | Seconds to wait for the deployment when `url` is omitted. |
+| `credential` | No | — | Label of a stored Ducky credential for signing into your app (a captured session or a test email+password). Only the label rides in the workflow — never the secret. |
+| `vercel-bypass` | No | — | Label of a stored Vercel Protection Bypass credential, for previews behind Vercel's wall. |
+| `login-hints` | No | — | Comma-separated URL fragments of your login page(s), e.g. `/enter,/portal`. Lets Ducky fail loudly when a session expires instead of demoing your login wall. |
+
+## Demoing an app behind a login
+
+If your app needs a login, store a credential with Ducky **once**, then reference it by label:
+
+```yaml
+      - uses: neocho/ducky-demo-action@v1
+        with:
+          api-key: ${{ secrets.DUCKY_API_KEY }}
+          credential: my-app-login      # stored via `ducky capture` or the API
+          vercel-bypass: my-bypass      # if your previews sit behind Vercel's wall
+```
+
+A stored **session** lands the demo already signed in; a stored **test email+password** has Ducky type it into your login form (the secret never enters the AI's context or the video trajectory).
 
 ## Get a key
 
