@@ -27,6 +27,15 @@ inputs:
     description: 'Ducky API base URL.'
     required: false
     default: 'https://api.tryducky.dev'
+  credential:
+    description: 'Label of a stored Ducky credential to sign into your app (a captured session or a test email+password). Store it once via `ducky capture` or the API; only the label rides here — never the secret.'
+    required: false
+  vercel-bypass:
+    description: 'Label of a stored Vercel Protection Bypass credential — lets Ducky through Vercel''s preview-protection wall.'
+    required: false
+  login-hints:
+    description: 'Comma-separated URL fragments of your app''s login page(s), e.g. "/enter,/portal". Helps Ducky fail loudly ("session stale") instead of demoing your login wall when a session expires.'
+    required: false
 
 runs:
   using: 'composite'
@@ -39,6 +48,9 @@ runs:
         RENDER_REEL: ${{ inputs.reel }}
         WAIT_TIMEOUT: ${{ inputs.wait-timeout }}
         DUCKY_API_BASE: ${{ inputs.api-base }}
+        RENDER_CREDENTIAL: ${{ inputs.credential }}
+        RENDER_VERCEL_BYPASS: ${{ inputs.vercel-bypass }}
+        RENDER_LOGIN_HINTS: ${{ inputs.login-hints }}
         PR_NUMBER: ${{ github.event.pull_request.number || github.event.number }}
         GH_TOKEN: ${{ github.token }}
         GH_REPO: ${{ github.repository }}
