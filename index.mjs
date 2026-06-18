@@ -66,7 +66,16 @@ async function resolvePr(sha) {
   const res = await gh(`/repos/${REPO}/commits/${sha}/pulls`);
   if (!res.ok) fail(`resolving the PR for ${sha.slice(0, 7)} failed (${res.status})`);
   const prs = await res.json();
-  if (!prs.length) fail("no pull request found for this commit — run on a PR event, or push a merged PR's commit.");
+  if (!prs.length) {
+    // A direct-to-main push with no associated PR has nothing to demo. Only push
+    // events reach here (pull_request events carry their own PR), so skip quietly
+    // (neutral, exit 0) instead of erroring with a red ✗ on every such commit.
+    if (env.GITHUB_EVENT_NAME === "push") {
+      console.log(`Ducky: no pull request for ${sha.slice(0, 7)} — skipping (direct push, nothing to demo).`);
+      process.exit(0);
+    }
+    fail("no pull request found for this commit — run on a PR event, or push a merged PR's commit.");
+  }
   const open = prs.find((p) => p.state === "open");
   return String((open ?? prs[0]).number);
 }
