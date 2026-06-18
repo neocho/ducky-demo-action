@@ -28,7 +28,7 @@ inputs:
     required: false
     default: 'https://api.tryducky.dev'
   credential:
-    description: 'Label of a stored Ducky credential to sign into your app (a captured session or a test email+password). Store it once via `ducky capture` or the API; only the label rides here — never the secret.'
+    description: 'Label of a stored Ducky credential to sign into your app (a captured session, or a test email+password). Capture a session with `ducky capture`; add a password in the dashboard or via the API. Only the label rides here — never the secret.'
     required: false
   vercel-bypass:
     description: 'Label of a stored Vercel Protection Bypass credential — lets Ducky through Vercel''s preview-protection wall.'
