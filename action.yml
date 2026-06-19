@@ -1,0 +1,57 @@
+name: 'Ducky Demo'
+description: 'Render an auto-generated demo video of your deployed app and post it as a PR comment.'
+author: 'Ducky'
+branding:
+  icon: 'video'
+  color: 'yellow'
+
+inputs:
+  api-key:
+    description: 'Ducky API key. Store it as a repo secret (e.g. DUCKY_API_KEY) and pass it via this input.'
+    required: true
+  url:
+    description: 'The deployed URL to render the demo against. Optional — when omitted, Ducky waits for this commit''s deployment (e.g. a Vercel/Netlify preview) and uses its URL.'
+    required: false
+  wait-timeout:
+    description: 'Seconds to wait for the deployment when url is omitted.'
+    required: false
+    default: '300'
+  task:
+    description: 'What to demonstrate, e.g. "Show the new checkout flow". Optional — when omitted, Ducky reads the PR (title, description, diff) and derives what to demo.'
+    required: false
+  reel:
+    description: 'Produce the polished narrated reel (true) or just the raw demo (false).'
+    required: false
+    default: 'true'
+  api-base:
+    description: 'Ducky API base URL.'
+    required: false
+    default: 'https://api.tryducky.dev'
+  credential:
+    description: 'Label of a stored Ducky credential to sign into your app (a captured session, or a test email+password). Capture a session with `ducky capture`; add a password in the dashboard or via the API. Only the label rides here — never the secret.'
+    required: false
+  vercel-bypass:
+    description: 'Label of a stored Vercel Protection Bypass credential — lets Ducky through Vercel''s preview-protection wall.'
+    required: false
+  login-hints:
+    description: 'Comma-separated URL fragments of your app''s login page(s), e.g. "/enter,/portal". Helps Ducky fail loudly ("session stale") instead of demoing your login wall when a session expires.'
+    required: false
+
+runs:
+  using: 'composite'
+  steps:
+    - shell: bash
+      env:
+        DUCKY_API_KEY: ${{ inputs.api-key }}
+        RENDER_URL: ${{ inputs.url }}
+        RENDER_TASK: ${{ inputs.task }}
+        RENDER_REEL: ${{ inputs.reel }}
+        WAIT_TIMEOUT: ${{ inputs.wait-timeout }}
+        DUCKY_API_BASE: ${{ inputs.api-base }}
+        RENDER_CREDENTIAL: ${{ inputs.credential }}
+        RENDER_VERCEL_BYPASS: ${{ inputs.vercel-bypass }}
+        RENDER_LOGIN_HINTS: ${{ inputs.login-hints }}
+        PR_NUMBER: ${{ github.event.pull_request.number || github.event.number }}
+        GH_TOKEN: ${{ github.token }}
+        GH_REPO: ${{ github.repository }}
+      run: node "${{ github.action_path }}/index.mjs"

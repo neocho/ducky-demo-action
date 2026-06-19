@@ -1,0 +1,92 @@
+# Ducky Demo
+
+Auto-generate a demo video of your app on every pull request.
+
+When a PR is ready, this action renders a short demo of your app and posts it back as a PR comment — no setup beyond a key and a few lines of workflow.
+
+## Quick start
+
+1. Add your Ducky API key as a repository secret named **`DUCKY_API_KEY`** (Settings → Secrets and variables → Actions).
+2. Create `.github/workflows/ducky.yml`:
+
+```yaml
+name: Ducky demo
+on:
+  pull_request:
+
+permissions:
+  contents: read       # read the PR diff (to derive what to demo)
+  deployments: read    # find the PR's preview deployment
+  pull-requests: write # post the demo comment
+
+jobs:
+  demo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: neocho/ducky-demo-action@v1
+        with:
+          api-key: ${{ secrets.DUCKY_API_KEY }}
+```
+
+Open a pull request — Ducky waits for the PR's preview deployment, reads the PR to decide what to demo, renders it, and posts the video. If a PR has nothing user-visible to show (a refactor, CI change, docs), Ducky skips it quietly.
+
+> The no-`url` setup works when your host deploys previews through GitHub (Vercel, Netlify, Render, …). Deploy some other way? See the recipes below.
+
+## Pointing Ducky at the right URL
+
+The demo is only as good as the URL it renders. Three setups:
+
+**1. Your host builds a preview per PR (Vercel, Netlify, Render, …)** — omit `url` (the Quick start above). Ducky polls GitHub until the preview deployment for the PR's commit succeeds and renders that preview, so the demo shows the PR's actual change. Tune the wait with `wait-timeout` (default 300s).
+
+**2. You deploy from your own workflow** — put the Ducky step after your deploy step and pass the URL you deployed:
+
+```yaml
+      - run: ./deploy.sh                       # your existing deploy
+      # if your deploy command returns before the new version is live,
+      # add your host's wait command here (e.g. aws ecs wait services-stable)
+      - uses: neocho/ducky-demo-action@v1
+        with:
+          url: https://staging.your-app.example.com
+          api-key: ${{ secrets.DUCKY_API_KEY }}
+```
+
+**3. You only deploy production, on merge** — trigger on push to your main branch instead. Ducky finds the merged PR from the commit and posts the demo there after the deploy:
+
+```yaml
+on:
+  push:
+    branches: [main]
+```
+
+(Don't point a `pull_request`-triggered run at prod — prod doesn't have the PR's change yet, so the demo would show the old version.)
+
+## Inputs
+
+| Input | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `api-key` | Yes | — | Your Ducky API key (use a repository secret). |
+| `url` | No | the PR's preview deployment | The deployed URL to demo. When omitted, Ducky waits for this commit's deployment via GitHub and uses its URL. |
+| `task` | No | derived from the PR | Force what to show, e.g. `"Sign up for a new account"`. When omitted, Ducky derives it from the PR's title, description, and diff. |
+| `reel` | No | `true` | Post the polished narrated reel, or the raw screen recording. |
+| `wait-timeout` | No | `300` | Seconds to wait for the deployment when `url` is omitted. |
+| `credential` | No | — | Label of a stored Ducky credential for signing into your app (a captured session or a test email+password). Only the label rides in the workflow — never the secret. |
+| `vercel-bypass` | No | — | Label of a stored Vercel Protection Bypass credential, for previews behind Vercel's wall. |
+| `login-hints` | No | — | Comma-separated URL fragments of your login page(s), e.g. `/enter,/portal`. Lets Ducky fail loudly when a session expires instead of demoing your login wall. |
+
+## Demoing an app behind a login
+
+If your app needs a login, store a credential with Ducky **once**, then reference it by label:
+
+```yaml
+      - uses: neocho/ducky-demo-action@v1
+        with:
+          api-key: ${{ secrets.DUCKY_API_KEY }}
+          credential: my-app-login      # stored via `ducky capture` or the API
+          vercel-bypass: my-bypass      # if your previews sit behind Vercel's wall
+```
+
+A stored **session** lands the demo already signed in; a stored **test email+password** has Ducky type it into your login form (the secret never enters the AI's context or the video trajectory).
+
+## Get a key
+
+Sign up at **[tryducky.dev](https://tryducky.dev)**.
