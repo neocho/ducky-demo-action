@@ -9,7 +9,7 @@ import { API, SHA, bodyOf, hits, runAction, SHA as FULL_SHA } from "./helpers.mj
 const TRIGGER = "/v1/github/trigger/octo-org/widget-app";
 const NO_OPEN_PR = "no open PR has this commit at its head";
 
-const prEvent = { pull_request: { number: 12, head: { sha: SHA } }, title: undefined };
+const prEvent = { pull_request: { number: 12, head: { sha: SHA, repo: { full_name: "octo-org/widget-app" } } } };
 
 // A complete self-render script: PR resolution (merged PR #7), derive,
 // render submit, poll, comment. Fallback cases splice a trigger rule ahead.
@@ -36,6 +36,7 @@ test("handoff enqueued: polls to done, posts nothing, calls no GitHub API", () =
   });
   assert.equal(code, 0, out);
   assert.match(out, /handed off to the Ducky GitHub App/);
+  assert.match(out, /finished \(done\)/, "must reach the terminal poll, not the expiry branch");
   assert.equal(hits(requests, "api.github.com").length, 0, "handoff path must not touch the GitHub API");
   assert.equal(hits(requests, "/issues/").length, 0, "handoff path must not post a comment");
   const trigger = bodyOf(requests, TRIGGER);
@@ -60,6 +61,7 @@ test("handoff render failed: exits non-zero", () => {
 test("handoff poll budget expiry: exits 0 with no comment (the App still posts)", () => {
   const { code, out, requests } = runAction({
     event: prEvent,
+    env: { RENDER_TIMEOUT: "1" },
     spec: [
       { url: TRIGGER, method: "POST", status: 202, json: { status: "enqueued", render_id: "rnd_1", pr_number: 12 } },
       { url: "/v1/renders/rnd_1", json: { status: "running" } },
@@ -241,7 +243,7 @@ test("explicit task and credential labels ride the trigger body verbatim", () =>
 
 test("an abbreviated sha never sends dedup (the server would 400 it)", () => {
   const { requests, code, out } = runAction({
-    event: { pull_request: { number: 12, head: { sha: "abc1234" } } },
+    event: { pull_request: { number: 12, head: { sha: "abc1234", repo: { full_name: "octo-org/widget-app" } } } },
     spec: [
       { url: TRIGGER, method: "POST", status: 202, json: { status: "enqueued", render_id: "rnd_1", pr_number: 12 } },
       { url: "/v1/renders/rnd_1", json: { status: "done" } },
@@ -338,6 +340,7 @@ test("poll errors are transient: a 429 mid-poll still reaches done and exits 0",
 test("handoff whose polls ALL fail goes red, never a silent green", () => {
   const { code, out } = runAction({
     event: prEvent,
+    env: { RENDER_TIMEOUT: "1" },
     spec: [
       { url: TRIGGER, method: "POST", status: 202, json: { status: "enqueued", render_id: "rnd_1", pr_number: 12 } },
       { url: "/v1/renders/rnd_1", status: 500, json: { error: { code: "internal", message: "Internal server error" } } },
@@ -358,14 +361,246 @@ test("a present code decides alone: stale no-open-PR reason text does not trigge
   assert.equal(hits(requests, "/v1/renders").length, 0, "code wins over the legacy reason match");
 });
 
-test("a negative poll-interval override clamps instead of hot-looping", () => {
+test("a fork PR skips quietly even when a key is present, making zero requests", () => {
+  const { code, out, requests } = runAction({
+    event: { pull_request: { number: 12, head: { sha: SHA, repo: { full_name: "stranger/widget-app-fork" } } } },
+    spec: [],
+  });
+  assert.equal(code, 0, out);
+  assert.match(out, /fork/);
+  assert.equal(requests.length, 0);
+});
+
+test("a same-repo PR with a genuinely missing key still fails loudly", () => {
+  const { code, out } = runAction({
+    event: { pull_request: { number: 12, head: { sha: SHA, repo: { full_name: "octo-org/widget-app" } } } },
+    env: { DUCKY_API_KEY: "" },
+    spec: [],
+  });
+  assert.equal(code, 1, out);
+  assert.match(out, /api-key/);
+});
+
+test("selection: a success whose only URL is the log page is never picked; the next round's environment_url wins", () => {
+  const { code, requests, out } = runAction({
+    event: prEvent,
+    env: { RENDER_URL: "" },
+    spec: [
+      { url: `/deployments?sha=${SHA}`, times: 1, json: [{ id: 41, created_at: "2026-01-01T00:00:00Z" }] },
+      { url: `/deployments?sha=${SHA}`, json: [
+        { id: 41, created_at: "2026-01-01T00:00:00Z" },
+        { id: 42, created_at: "2026-01-01T00:05:00Z" },
+      ] },
+      { url: "/deployments/41/statuses", json: [
+        { state: "success", environment_url: "", target_url: "https://ci.example.test/log/41", created_at: "2026-01-01T00:01:00Z" },
+      ] },
+      { url: "/deployments/42/statuses", json: [
+        { state: "success", environment_url: "https://preview-42.example.test", target_url: "https://ci.example.test/log/42", created_at: "2026-01-01T00:06:00Z" },
+      ] },
+      { url: TRIGGER, method: "POST", status: 202, json: { status: "enqueued", render_id: "rnd_1", pr_number: 12 } },
+      { url: "/v1/renders/rnd_1", json: { status: "done" } },
+    ],
+  });
+  assert.equal(code, 0, out);
+  const body = bodyOf(requests, TRIGGER);
+  assert.equal(body.url, "https://preview-42.example.test");
+});
+
+test("selection: a deployment retired to inactive loses to one currently succeeded, whatever is newer", () => {
+  const { code, requests, out } = runAction({
+    event: prEvent,
+    env: { RENDER_URL: "" },
+    spec: [
+      { url: `/deployments?sha=${SHA}`, json: [
+        { id: 51, created_at: "2026-01-01T00:10:00Z" },
+        { id: 52, created_at: "2026-01-01T00:00:00Z" },
+      ] },
+      { url: "/deployments/51/statuses", json: [
+        { state: "inactive", environment_url: "", created_at: "2026-01-01T00:20:00Z" },
+        { state: "success", environment_url: "https://sub-app.example.test/storybook", created_at: "2026-01-01T00:11:00Z" },
+      ] },
+      { url: "/deployments/52/statuses", json: [
+        { state: "success", environment_url: "https://site.example.test", created_at: "2026-01-01T00:01:00Z" },
+      ] },
+      { url: TRIGGER, method: "POST", status: 202, json: { status: "enqueued", render_id: "rnd_1", pr_number: 12 } },
+      { url: "/v1/renders/rnd_1", json: { status: "done" } },
+    ],
+  });
+  assert.equal(code, 0, out);
+  assert.equal(bodyOf(requests, TRIGGER).url, "https://site.example.test");
+});
+
+test("selection: when every deployment is retired, the retired success URL still serves (tier B)", () => {
+  const { code, requests, out } = runAction({
+    event: prEvent,
+    env: { RENDER_URL: "" },
+    spec: [
+      { url: `/deployments?sha=${SHA}`, json: [{ id: 61, created_at: "2026-01-01T00:00:00Z" }] },
+      { url: "/deployments/61/statuses", json: [
+        { state: "inactive", environment_url: "", created_at: "2026-01-01T00:20:00Z" },
+        { state: "success", environment_url: "https://retired-preview.example.test", created_at: "2026-01-01T00:01:00Z" },
+      ] },
+      { url: TRIGGER, method: "POST", status: 202, json: { status: "enqueued", render_id: "rnd_1", pr_number: 12 } },
+      { url: "/v1/renders/rnd_1", json: { status: "done" } },
+    ],
+  });
+  assert.equal(code, 0, out);
+  assert.equal(bodyOf(requests, TRIGGER).url, "https://retired-preview.example.test");
+});
+
+test("selection: deployments are sorted client-side, so an oldest-first API order still yields the newest", () => {
+  const { code, requests, out } = runAction({
+    event: prEvent,
+    env: { RENDER_URL: "" },
+    spec: [
+      { url: `/deployments?sha=${SHA}`, json: [
+        { id: 71, created_at: "2026-01-01T00:00:00Z" },
+        { id: 72, created_at: "2026-01-01T00:10:00Z" },
+      ] },
+      { url: "/deployments/71/statuses", json: [
+        { state: "success", environment_url: "https://old-preview.example.test", created_at: "2026-01-01T00:01:00Z" },
+      ] },
+      { url: "/deployments/72/statuses", json: [
+        { state: "success", environment_url: "https://new-preview.example.test", created_at: "2026-01-01T00:11:00Z" },
+      ] },
+      { url: TRIGGER, method: "POST", status: 202, json: { status: "enqueued", render_id: "rnd_1", pr_number: 12 } },
+      { url: "/v1/renders/rnd_1", json: { status: "done" } },
+    ],
+  });
+  assert.equal(code, 0, out);
+  assert.equal(bodyOf(requests, TRIGGER).url, "https://new-preview.example.test");
+});
+
+test("render-timeout 0 still reads a finished render: the poll runs before any sleep or expiry", () => {
   const { code, out } = runAction({
     event: prEvent,
-    env: { POLL_INTERVAL_MS: "-5" },
+    env: { RENDER_TIMEOUT: "0" },
     spec: [
       { url: TRIGGER, method: "POST", status: 202, json: { status: "enqueued", render_id: "rnd_1", pr_number: 12 } },
       { url: "/v1/renders/rnd_1", json: { status: "done" } },
     ],
   });
   assert.equal(code, 0, out);
+  assert.match(out, /finished \(done\)/);
+});
+
+test("fallback render-timeout expiry: posts the past-tense note and exits 0", () => {
+  const { code, out, requests } = runAction({
+    env: { ...pushEnv, RENDER_TIMEOUT: "0" },
+    spec: [
+      { url: TRIGGER, method: "POST", status: 200, json: { status: "skipped", reason: NO_OPEN_PR } },
+      { url: "/commits/", json: [{ number: 7, state: "closed" }] },
+      { url: "/pulls/7", times: 1, json: { title: "Add widget" } },
+      { url: "/pulls/7", times: 1, text: "diff" },
+      { url: "/v1/derive", method: "POST", json: { demoable: true, task: "Show the widget" } },
+      { url: "/v1/renders", method: "POST", json: { id: "rnd_slow" } },
+      { url: "/v1/renders/rnd_slow", json: { status: "running" } },
+      { url: "/issues/7/comments", method: "POST", status: 201, json: {} },
+    ],
+  });
+  assert.equal(code, 0, out);
+  const note = bodyOf(requests, "/issues/7/comments");
+  assert.match(note.body, /still rendering when this check finished/);
+  assert.match(out, /render-timeout/);
+});
+
+// Smoke only: a negative interval clamps to 1ms in code; behaviorally a hot
+// loop still terminates here, so this pins "the sleep path runs and the run
+// completes", not the clamp value itself.
+test("a negative poll-interval override still polls through running to done", () => {
+  const { code, out } = runAction({
+    event: prEvent,
+    env: { POLL_INTERVAL_MS: "-5" },
+    spec: [
+      { url: TRIGGER, method: "POST", status: 202, json: { status: "enqueued", render_id: "rnd_1", pr_number: 12 } },
+      { url: "/v1/renders/rnd_1", times: 2, json: { status: "running" } },
+      { url: "/v1/renders/rnd_1", json: { status: "done" } },
+    ],
+  });
+  assert.equal(code, 0, out);
+  assert.match(out, /finished \(done\)/);
+});
+
+test("a deleted fork (head.repo null) still reads as a fork and skips", () => {
+  const { code, out, requests } = runAction({
+    event: { pull_request: { number: 12, head: { sha: SHA, repo: null } } },
+    spec: [],
+  });
+  assert.equal(code, 0, out);
+  assert.match(out, /fork/);
+  assert.equal(requests.length, 0);
+});
+
+test("pull_request_target is never treated as a fork skip (it carries secrets by design)", () => {
+  const { code, out, requests } = runAction({
+    event: { pull_request: { number: 12, head: { sha: SHA, repo: { full_name: "stranger/widget-app-fork" } }, base: { repo: { full_name: "octo-org/widget-app" } } } },
+    env: { GITHUB_EVENT_NAME: "pull_request_target" },
+    spec: [
+      { url: TRIGGER, method: "POST", status: 202, json: { status: "enqueued", render_id: "rnd_1", pr_number: 12 } },
+      { url: "/v1/renders/rnd_1", json: { status: "done" } },
+    ],
+  });
+  assert.equal(code, 0, out);
+  assert.equal(hits(requests, TRIGGER).length, 1, "the run must proceed, not fork-skip");
+});
+
+test("self-render whose polls ALL fail goes red with no false note", () => {
+  const { code, out, requests } = runAction({
+    env: { ...pushEnv, RENDER_TIMEOUT: "1" },
+    spec: [
+      { url: TRIGGER, method: "POST", status: 404, json: { error: { code: "not_found", message: "no GitHub App installation covers that repo" } } },
+      { url: "/commits/", json: [{ number: 7, state: "closed" }] },
+      { url: "/pulls/7", times: 1, json: { title: "Add widget" } },
+      { url: "/pulls/7", times: 1, text: "diff" },
+      { url: "/v1/derive", method: "POST", json: { demoable: true, task: "Show the widget" } },
+      { url: "/v1/renders", method: "POST", json: { id: "rnd_x" } },
+      { url: "/v1/renders/rnd_x", status: 500, json: { error: { code: "internal", message: "Internal server error" } } },
+    ],
+  });
+  assert.equal(code, 1, out);
+  assert.match(out, /could not be read even once/);
+  assert.equal(hits(requests, "/issues/").length, 0, "no note may be posted about a render never observed");
+});
+
+test("a failed note POST logs honestly and still exits 0", () => {
+  const { code, out } = runAction({
+    env: { ...pushEnv, RENDER_TIMEOUT: "0" },
+    spec: [
+      { url: TRIGGER, method: "POST", status: 200, json: { status: "skipped", reason: NO_OPEN_PR } },
+      { url: "/commits/", json: [{ number: 7, state: "closed" }] },
+      { url: "/pulls/7", times: 1, json: { title: "Add widget" } },
+      { url: "/pulls/7", times: 1, text: "diff" },
+      { url: "/v1/derive", method: "POST", json: { demoable: true, task: "Show the widget" } },
+      { url: "/v1/renders", method: "POST", json: { id: "rnd_slow" } },
+      { url: "/v1/renders/rnd_slow", json: { status: "running" } },
+      { url: "/issues/7/comments", method: "POST", status: 403, json: { message: "Resource not accessible by integration" } },
+    ],
+  });
+  assert.equal(code, 0, out);
+  assert.match(out, /could not post the note/);
+});
+
+test("selection: with every deployment retired, the NEWEST retired URL wins", () => {
+  const { code, requests, out } = runAction({
+    event: prEvent,
+    env: { RENDER_URL: "" },
+    spec: [
+      { url: `/deployments?sha=${SHA}`, json: [
+        { id: 91, created_at: "2026-01-01T00:10:00Z" },
+        { id: 92, created_at: "2026-01-01T00:00:00Z" },
+      ] },
+      { url: "/deployments/91/statuses", json: [
+        { state: "inactive", environment_url: "", created_at: "2026-01-01T00:30:00Z" },
+        { state: "success", environment_url: "https://retired-new.example.test", created_at: "2026-01-01T00:11:00Z" },
+      ] },
+      { url: "/deployments/92/statuses", json: [
+        { state: "inactive", environment_url: "", created_at: "2026-01-01T00:29:00Z" },
+        { state: "success", environment_url: "https://retired-old.example.test", created_at: "2026-01-01T00:01:00Z" },
+      ] },
+      { url: TRIGGER, method: "POST", status: 202, json: { status: "enqueued", render_id: "rnd_1", pr_number: 12 } },
+      { url: "/v1/renders/rnd_1", json: { status: "done" } },
+    ],
+  });
+  assert.equal(code, 0, out);
+  assert.equal(bodyOf(requests, TRIGGER).url, "https://retired-new.example.test");
 });
