@@ -2,7 +2,7 @@
 
 Auto-generate a demo video of your app on every pull request.
 
-When a PR is ready, this action renders a short demo of your app and posts it back as a PR comment — no setup beyond a key and a few lines of workflow.
+When a PR is ready, this action renders a short demo of your app and posts it back as a PR comment: no setup beyond a key and a few lines of workflow.
 
 ## Quick start
 
@@ -28,17 +28,21 @@ jobs:
           api-key: ${{ secrets.DUCKY_API_KEY }}
 ```
 
-Open a pull request — Ducky waits for the PR's preview deployment, reads the PR to decide what to demo, renders it, and posts the video. If a PR has nothing user-visible to show (a refactor, CI change, docs), Ducky skips it quietly.
+Open a pull request: Ducky waits for the PR's preview deployment, reads the PR to decide what to demo, renders it, and posts the video. If a PR has nothing user-visible to show (a refactor, CI change, docs), Ducky skips it quietly.
 
-> The no-`url` setup works when your host deploys previews through GitHub (Vercel, Netlify, Render, …). Deploy some other way? See the recipes below.
+> The no-`url` setup works when your host reports its deploys to GitHub's deployments API with the deployed URL, per PR. Vercel does. Netlify and Cloudflare Pages don't: pass `url` explicitly there (recipe 2 below). GitHub Pages reports deploys too, but only for its one site, so it pairs with recipe 3 (deploy on merge), not with per-PR previews.
+
+## Also using the Ducky GitHub App?
+
+If the [Ducky GitHub App](https://tryducky.dev) is installed on the repo, the action hands the render to the App instead of rendering twice: one render, one comment, posted by the App with its full verification detail. The action keeps the CI signal (the check goes red if the render fails within `render-timeout`; a render that outlives the budget leaves a green check and finishes on the dashboard). Repos without the App keep the action's own comment, exactly as before. Nothing to configure either way.
 
 ## Pointing Ducky at the right URL
 
 The demo is only as good as the URL it renders. Three setups:
 
-**1. Your host builds a preview per PR (Vercel, Netlify, Render, …)** — omit `url` (the Quick start above). Ducky polls GitHub until the preview deployment for the PR's commit succeeds and renders that preview, so the demo shows the PR's actual change. Tune the wait with `wait-timeout` (default 300s).
+**1. Your host builds a preview per PR and reports it to GitHub (Vercel, …):** omit `url` (the Quick start above). Ducky polls GitHub until a deployment of the PR's commit succeeds with a URL and renders that, so the demo shows the PR's actual change. Tune the wait with `wait-timeout` (default 300s). Hosts that deploy without writing GitHub deployments (Netlify, Cloudflare Pages) need recipe 2.
 
-**2. You deploy from your own workflow** — put the Ducky step after your deploy step and pass the URL you deployed:
+**2. You deploy from your own workflow:** put the Ducky step after your deploy step and pass the URL you deployed:
 
 ```yaml
       - run: ./deploy.sh                       # your existing deploy
@@ -50,7 +54,7 @@ The demo is only as good as the URL it renders. Three setups:
           api-key: ${{ secrets.DUCKY_API_KEY }}
 ```
 
-**3. You only deploy production, on merge** — trigger on push to your main branch instead. Ducky finds the merged PR from the commit and posts the demo there after the deploy:
+**3. You only deploy production, on merge (this is where GitHub Pages fits):** trigger on push to your main branch instead. Ducky finds the merged PR from the commit and posts the demo there after the deploy:
 
 ```yaml
 on:
@@ -58,20 +62,21 @@ on:
     branches: [main]
 ```
 
-(Don't point a `pull_request`-triggered run at prod — prod doesn't have the PR's change yet, so the demo would show the old version.)
+(Don't point a `pull_request`-triggered run at prod: prod doesn't have the PR's change yet, so the demo would show the old version.)
 
 ## Inputs
 
 | Input | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `api-key` | Yes | — | Your Ducky API key (use a repository secret). |
+| `api-key` | Yes | (none) | Your Ducky API key (use a repository secret). |
 | `url` | No | the PR's preview deployment | The deployed URL to demo. When omitted, Ducky waits for this commit's deployment via GitHub and uses its URL. |
 | `task` | No | derived from the PR | Force what to show, e.g. `"Sign up for a new account"`. When omitted, Ducky derives it from the PR's title, description, and diff. |
 | `reel` | No | `true` | Post the polished narrated reel, or the raw screen recording. |
 | `wait-timeout` | No | `300` | Seconds to wait for the deployment when `url` is omitted. |
-| `credential` | No | — | Label of a stored Ducky credential for signing into your app (a captured session or a test email+password). Only the label rides in the workflow — never the secret. |
-| `vercel-bypass` | No | — | Label of a stored Vercel Protection Bypass credential, for previews behind Vercel's wall. |
-| `login-hints` | No | — | Comma-separated URL fragments of your login page(s), e.g. `/enter,/portal`. Lets Ducky fail loudly when a session expires instead of demoing your login wall. |
+| `render-timeout` | No | `600` | Seconds to watch the render before the step moves on. Set `0` to submit and not wait. The demo still finishes server-side; without the App installed, the step leaves a note on the PR instead of the video. |
+| `credential` | No | (none) | Label of a stored Ducky credential for signing into your app (a captured session or a test email+password). Only the label rides in the workflow, never the secret. |
+| `vercel-bypass` | No | (none) | Label of a stored Vercel Protection Bypass credential, for previews behind Vercel's wall. |
+| `login-hints` | No | (none) | Comma-separated URL fragments of your login page(s), e.g. `/enter,/portal`. Lets Ducky fail loudly when a session expires instead of demoing your login wall. |
 
 ## Demoing an app behind a login
 

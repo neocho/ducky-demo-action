@@ -35,9 +35,12 @@ export function runAction({ spec = [], env = {}, event = {} } = {}) {
         GITHUB_EVENT_PATH: eventPath,
         GITHUB_EVENT_NAME: "pull_request",
         GITHUB_SHA: SHA,
-        // 1ms polls so timeout-shaped cases finish instantly.
+        // 1ms polls; a 30s default render budget keeps happy-path tests off
+        // the expiry branch even on a stalled runner. Expiry-shaped cases set
+        // RENDER_TIMEOUT to "0"/"1" explicitly.
         POLL_INTERVAL_MS: "1",
         DEPLOY_POLL_MS: "1",
+        RENDER_TIMEOUT: "30",
         RENDER_URL: "https://preview.example.test",
         ...env,
       },

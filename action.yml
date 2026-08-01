@@ -10,14 +10,18 @@ inputs:
     description: 'Ducky API key. Store it as a repo secret (e.g. DUCKY_API_KEY) and pass it via this input.'
     required: true
   url:
-    description: 'The deployed URL to render the demo against. Optional — when omitted, Ducky waits for this commit''s deployment (e.g. a Vercel/Netlify preview) and uses its URL.'
+    description: 'The deployed URL to render the demo against. Optional. When omitted, Ducky waits for this commit''s deployment reported via GitHub (e.g. a Vercel preview) and uses its URL.'
     required: false
   wait-timeout:
     description: 'Seconds to wait for the deployment when url is omitted.'
     required: false
     default: '300'
+  render-timeout:
+    description: 'Seconds to wait for the render before the step stops watching. Set 0 to submit and not wait. The demo still finishes server-side; on repos without the Ducky GitHub App the step leaves a note on the PR instead of the video.'
+    required: false
+    default: '600'
   task:
-    description: 'What to demonstrate, e.g. "Show the new checkout flow". Optional — when omitted, Ducky reads the PR (title, description, diff) and derives what to demo.'
+    description: 'What to demonstrate, e.g. "Show the new checkout flow". Optional. When omitted, Ducky reads the PR (title, description, diff) and derives what to demo.'
     required: false
   reel:
     description: 'Produce the polished narrated reel (true) or just the raw demo (false).'
@@ -28,10 +32,10 @@ inputs:
     required: false
     default: 'https://api.tryducky.dev'
   credential:
-    description: 'Label of a stored Ducky credential to sign into your app (a captured session, or a test email+password). Capture a session with `ducky capture`; add a password in the dashboard or via the API. Only the label rides here — never the secret.'
+    description: 'Label of a stored Ducky credential to sign into your app (a captured session, or a test email+password). Capture a session with `ducky capture`; add a password in the dashboard or via the API. Only the label rides here, never the secret.'
     required: false
   vercel-bypass:
-    description: 'Label of a stored Vercel Protection Bypass credential — lets Ducky through Vercel''s preview-protection wall.'
+    description: 'Label of a stored Vercel Protection Bypass credential; lets Ducky through Vercel''s preview-protection wall.'
     required: false
   login-hints:
     description: 'Comma-separated URL fragments of your app''s login page(s), e.g. "/enter,/portal". Helps Ducky fail loudly ("session stale") instead of demoing your login wall when a session expires.'
@@ -47,6 +51,7 @@ runs:
         RENDER_TASK: ${{ inputs.task }}
         RENDER_REEL: ${{ inputs.reel }}
         WAIT_TIMEOUT: ${{ inputs.wait-timeout }}
+        RENDER_TIMEOUT: ${{ inputs.render-timeout }}
         DUCKY_API_BASE: ${{ inputs.api-base }}
         RENDER_CREDENTIAL: ${{ inputs.credential }}
         RENDER_VERCEL_BYPASS: ${{ inputs.vercel-bypass }}
