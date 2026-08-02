@@ -11,14 +11,17 @@ const NO_OPEN_PR = "no open PR has this commit at its head";
 
 const prEvent = { pull_request: { number: 12, head: { sha: SHA, repo: { full_name: "octo-org/widget-app" } } } };
 
-// A complete self-render script: PR resolution (merged PR #7), derive,
-// render submit, poll, comment. Fallback cases splice a trigger rule ahead.
+// A complete self-render script: PR resolution (merged PR #7), the combined
+// derive+create call, poll, the served comment, post. Fallback cases splice a
+// trigger rule ahead. The comment rule sits BEFORE the poll rule: rules
+// substring-match in order and the poll URL is a prefix of the comment URL.
+const COMPOSED_BODY = "### 🦆 Ducky demo\n\ncomposed by the server";
 const fallbackSpec = [
   { url: "/commits/", json: [{ number: 7, state: "closed" }] },
   { url: "/pulls/7", times: 1, json: { title: "Add widget", body: "adds a widget" } },
   { url: "/pulls/7", times: 1, text: "diff --git a/widget.js b/widget.js" },
-  { url: "/v1/derive", method: "POST", json: { demoable: true, task: "Show the widget" } },
-  { url: "/v1/renders", method: "POST", json: { id: "rnd_fallback" } },
+  { url: "/v1/renders/from-pr", method: "POST", status: 202, json: { id: "rnd_fallback", status: "queued" } },
+  { url: "/v1/renders/rnd_fallback/comment", json: { outcome: "ready", post: true, body: COMPOSED_BODY } },
   { url: "/v1/renders/rnd_fallback", json: { status: "done", demo_url: "https://cdn.example.test/demo.mp4" } },
   { url: "/issues/7/comments", method: "POST", status: 201, json: {} },
 ];
@@ -83,7 +86,17 @@ test("skipped with the no-open-PR reason: falls back, resolves the merged PR, po
   assert.equal(code, 0, out);
   assert.match(out, /rendering from the Action/);
   assert.equal(hits(requests, "/issues/7/comments").length, 1, "fallback must post the comment");
-  assert.ok(bodyOf(requests, "/v1/renders"), "fallback must self-render");
+  assert.equal(bodyOf(requests, "/issues/7/comments").body, COMPOSED_BODY, "the served body posts verbatim");
+  assert.equal(hits(requests, "/from-pr").length, 1, "exactly one submission");
+  // strict order: submit, then poll to terminal, then the comment fetch, then the post
+  const urls = requests.map((r) => r.url);
+  const iSubmit = urls.findIndex((u) => u.includes("/from-pr"));
+  const iComment = urls.findIndex((u) => u.includes("/rnd_fallback/comment"));
+  const iPost = urls.findIndex((u) => u.includes("/issues/7/comments"));
+  const iPoll = urls.findIndex((u) => u.includes("/rnd_fallback") && !u.includes("/comment"));
+  assert.ok(iSubmit < iPoll && iPoll < iComment && iComment < iPost, `order was ${urls.join(" -> ")}`);
+  // B6: the PR description ships with the content
+  assert.equal(bodyOf(requests, "/from-pr").body, "adds a widget");
 });
 
 test("skipped with code no_open_pr: falls back even when the reason copy changes", () => {
@@ -200,8 +213,7 @@ test("5xx from the trigger AND the fallback (whole API down): the check goes red
       { url: "/commits/", json: [{ number: 7, state: "closed" }] },
       { url: "/pulls/7", times: 1, json: { title: "Add widget" } },
       { url: "/pulls/7", times: 1, text: "diff" },
-      { url: "/v1/derive", method: "POST", json: { demoable: true, task: "Show the widget" } },
-      { url: "/v1/renders", method: "POST", status: 500, json: { error: { code: "internal", message: "Internal server error" } } },
+      { url: "/v1/renders/from-pr", method: "POST", status: 500, json: { error: { code: "internal", message: "Internal server error" } } },
     ],
   });
   assert.equal(code, 1, out);
@@ -492,8 +504,7 @@ test("fallback render-timeout expiry: posts the past-tense note and exits 0", ()
       { url: "/commits/", json: [{ number: 7, state: "closed" }] },
       { url: "/pulls/7", times: 1, json: { title: "Add widget" } },
       { url: "/pulls/7", times: 1, text: "diff" },
-      { url: "/v1/derive", method: "POST", json: { demoable: true, task: "Show the widget" } },
-      { url: "/v1/renders", method: "POST", json: { id: "rnd_slow" } },
+      { url: "/v1/renders/from-pr", method: "POST", status: 202, json: { id: "rnd_slow", status: "queued" } },
       { url: "/v1/renders/rnd_slow", json: { status: "running" } },
       { url: "/issues/7/comments", method: "POST", status: 201, json: {} },
     ],
@@ -502,6 +513,7 @@ test("fallback render-timeout expiry: posts the past-tense note and exits 0", ()
   const note = bodyOf(requests, "/issues/7/comments");
   assert.match(note.body, /still rendering when this check finished/);
   assert.match(out, /render-timeout/);
+  assert.equal(hits(requests, "/rnd_slow/comment").length, 0, "no comment fetch on the timeout path");
 });
 
 // Smoke only: a negative interval clamps to 1ms in code; behaviorally a hot
@@ -552,8 +564,7 @@ test("self-render whose polls ALL fail goes red with no false note", () => {
       { url: "/commits/", json: [{ number: 7, state: "closed" }] },
       { url: "/pulls/7", times: 1, json: { title: "Add widget" } },
       { url: "/pulls/7", times: 1, text: "diff" },
-      { url: "/v1/derive", method: "POST", json: { demoable: true, task: "Show the widget" } },
-      { url: "/v1/renders", method: "POST", json: { id: "rnd_x" } },
+      { url: "/v1/renders/from-pr", method: "POST", status: 202, json: { id: "rnd_x", status: "queued" } },
       { url: "/v1/renders/rnd_x", status: 500, json: { error: { code: "internal", message: "Internal server error" } } },
     ],
   });
@@ -570,14 +581,140 @@ test("a failed note POST logs honestly and still exits 0", () => {
       { url: "/commits/", json: [{ number: 7, state: "closed" }] },
       { url: "/pulls/7", times: 1, json: { title: "Add widget" } },
       { url: "/pulls/7", times: 1, text: "diff" },
-      { url: "/v1/derive", method: "POST", json: { demoable: true, task: "Show the widget" } },
-      { url: "/v1/renders", method: "POST", json: { id: "rnd_slow" } },
+      { url: "/v1/renders/from-pr", method: "POST", status: 202, json: { id: "rnd_slow", status: "queued" } },
       { url: "/v1/renders/rnd_slow", json: { status: "running" } },
       { url: "/issues/7/comments", method: "POST", status: 403, json: { message: "Resource not accessible by integration" } },
     ],
   });
   assert.equal(code, 0, out);
   assert.match(out, /could not post the note/);
+});
+
+test("an explicit task still ships the PR content, so claims and description reach the row", () => {
+  const { code, requests, out } = runAction({
+    env: { ...pushEnv, RENDER_TASK: "Show the new checkout flow" },
+    spec: [
+      { url: TRIGGER, method: "POST", status: 200, json: { status: "skipped", reason: NO_OPEN_PR, code: "no_open_pr" } },
+      ...fallbackSpec,
+    ],
+  });
+  assert.equal(code, 0, out);
+  const body = bodyOf(requests, "/from-pr");
+  assert.equal(body.task, "Show the new checkout flow");
+  assert.equal(body.title, "Add widget");
+  assert.match(body.diff, /^diff --git/);
+  assert.equal(hits(requests, "/v1/derive").length, 0, "the split derive call is gone");
+});
+
+test("a judged no-demo from the combined call exits 0 with no render, no poll, no comment", () => {
+  const { code, out, requests } = runAction({
+    env: pushEnv,
+    spec: [
+      { url: TRIGGER, method: "POST", status: 200, json: { status: "skipped", reason: NO_OPEN_PR, code: "no_open_pr" } },
+      { url: "/commits/", json: [{ number: 7, state: "closed" }] },
+      { url: "/pulls/7", times: 1, json: { title: "Add widget" } },
+      { url: "/pulls/7", times: 1, text: "diff" },
+      { url: "/v1/renders/from-pr", method: "POST", status: 200, json: { status: "skipped", code: "not_demoable", reason: "copy-only change" } },
+    ],
+  });
+  assert.equal(code, 0, out);
+  assert.match(out, /nothing user-visible to demo/);
+  assert.equal(hits(requests, "/v1/renders/from-pr").length, 1, "the one submission is the only render call");
+  assert.equal(hits(requests, "/issues/").length, 0);
+  const submitAt = requests.findIndex((r) => r.url.includes("/from-pr"));
+  assert.equal(requests.slice(submitAt + 1).filter((r) => r.url.includes("/v1/renders/")).length, 0, "nothing to poll after a no-render skip");
+});
+
+test("a held render posts the served held note verbatim and stays green", () => {
+  const heldBody = "### 🦆 Ducky demo held\n\nheld note";
+  const { code, requests, out } = runAction({
+    env: pushEnv,
+    spec: [
+      { url: TRIGGER, method: "POST", status: 200, json: { status: "skipped", reason: NO_OPEN_PR, code: "no_open_pr" } },
+      { url: "/commits/", json: [{ number: 7, state: "closed" }] },
+      { url: "/pulls/7", times: 1, json: { title: "Add widget" } },
+      { url: "/pulls/7", times: 1, text: "diff" },
+      { url: "/v1/renders/from-pr", method: "POST", status: 202, json: { id: "rnd_h", status: "queued" } },
+      { url: "/v1/renders/rnd_h/comment", json: { outcome: "held", post: true, body: heldBody } },
+      { url: "/v1/renders/rnd_h", json: { status: "done" } },
+      { url: "/issues/7/comments", method: "POST", status: 201, json: {} },
+    ],
+  });
+  assert.equal(code, 0, out);
+  assert.equal(bodyOf(requests, "/issues/7/comments").body, heldBody);
+});
+
+test("a failed render posts the served failure note and the check goes red", () => {
+  const failBody = "### 🦆 Couldn't render the demo";
+  const { code, requests, out } = runAction({
+    env: pushEnv,
+    spec: [
+      { url: TRIGGER, method: "POST", status: 200, json: { status: "skipped", reason: NO_OPEN_PR, code: "no_open_pr" } },
+      { url: "/commits/", json: [{ number: 7, state: "closed" }] },
+      { url: "/pulls/7", times: 1, json: { title: "Add widget" } },
+      { url: "/pulls/7", times: 1, text: "diff" },
+      { url: "/v1/renders/from-pr", method: "POST", status: 202, json: { id: "rnd_f", status: "queued" } },
+      { url: "/v1/renders/rnd_f/comment", json: { outcome: "failed", post: true, body: failBody } },
+      { url: "/v1/renders/rnd_f", json: { status: "failed" } },
+      { url: "/issues/7/comments", method: "POST", status: 201, json: {} },
+    ],
+  });
+  assert.equal(code, 1, out);
+  assert.equal(bodyOf(requests, "/issues/7/comments").body, failBody, "the failure note posts before the red exit");
+});
+
+test("an unreachable comment endpoint exits by render status with no invented body", () => {
+  const { code, requests, out } = runAction({
+    env: pushEnv,
+    spec: [
+      { url: TRIGGER, method: "POST", status: 200, json: { status: "skipped", reason: NO_OPEN_PR, code: "no_open_pr" } },
+      { url: "/commits/", json: [{ number: 7, state: "closed" }] },
+      { url: "/pulls/7", times: 1, json: { title: "Add widget" } },
+      { url: "/pulls/7", times: 1, text: "diff" },
+      { url: "/v1/renders/from-pr", method: "POST", status: 202, json: { id: "rnd_d", status: "queued" } },
+      { url: "/v1/renders/rnd_d/comment", status: 500, json: {} },
+      { url: "/v1/renders/rnd_d", json: { status: "done" } },
+    ],
+  });
+  assert.equal(code, 0, out);
+  assert.match(out, /could not fetch the composed comment/);
+  assert.equal(hits(requests, "/issues/").length, 0);
+});
+
+test("a non-406 diff failure fails loudly before any render is submitted", () => {
+  const { code, requests, out } = runAction({
+    env: pushEnv,
+    spec: [
+      { url: TRIGGER, method: "POST", status: 200, json: { status: "skipped", reason: NO_OPEN_PR, code: "no_open_pr" } },
+      { url: "/commits/", json: [{ number: 7, state: "closed" }] },
+      { url: "/pulls/7", times: 1, json: { title: "Add widget" } },
+      { url: "/pulls/7", times: 1, status: 403, json: { message: "Resource not accessible" } },
+    ],
+  });
+  assert.equal(code, 1, out);
+  assert.match(out, /fetching the PR diff failed \(403\)/);
+  assert.equal(hits(requests, "/from-pr").length, 0);
+});
+
+test("a 406-withheld diff still renders: the combined call ships title and body alone", () => {
+  const { code, requests, out } = runAction({
+    env: pushEnv,
+    spec: [
+      { url: TRIGGER, method: "POST", status: 200, json: { status: "skipped", reason: NO_OPEN_PR, code: "no_open_pr" } },
+      { url: "/commits/", json: [{ number: 7, state: "closed" }] },
+      { url: "/pulls/7", times: 1, json: { title: "Add widget", body: "adds it" } },
+      { url: "/pulls/7", times: 1, status: 406, json: { message: "Sorry, the diff exceeded the maximum" } },
+      { url: "/v1/renders/from-pr", method: "POST", status: 202, json: { id: "rnd_n", status: "queued" } },
+      { url: "/v1/renders/rnd_n/comment", json: { outcome: "ready", post: true, body: "b" } },
+      { url: "/v1/renders/rnd_n", json: { status: "done" } },
+      { url: "/issues/7/comments", method: "POST", status: 201, json: {} },
+    ],
+  });
+  assert.equal(code, 0, out);
+  assert.match(out, /withheld the diff/);
+  const body = bodyOf(requests, "/from-pr");
+  assert.equal(body.title, "Add widget");
+  assert.ok(!("diff" in body));
 });
 
 test("selection: with every deployment retired, the NEWEST retired URL wins", () => {
