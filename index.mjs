@@ -12,8 +12,12 @@
 //   - No `url` input → waits for this commit's deployment (GitHub deployments
 //     API) and renders its environment_url, so the demo always shows the PR's
 //     actual code.
-//   - No `task` input → sends the PR's title/body/diff to Ducky, which derives
-//     what to demo, or says nothing user-visible changed (clean skip).
+//   - Self-rendering ships the PR's title/body/diff with the render request;
+//     Ducky derives what to demo (an explicit `task` input overrides only the
+//     objective), or says nothing user-visible changed (clean skip). The PR
+//     comment itself is composed by the server and posted verbatim, so it
+//     matches what the Ducky GitHub App would post: verified demos, held
+//     notes, failure notes, skip notes.
 //   - Works on pull_request AND push events (the PR is resolved from the
 //     commit when it's not in the event context).
 
@@ -351,9 +355,12 @@ async function tryAppHandoff(sha) {
   fail(`handoff rejected (${res.status}): ${(await res.text()).slice(0, 300)}`);
 }
 
-// No `task` input → derive one from the PR. Ducky's server decides whether the
-// change is user-visible; if not, skip cleanly (exit 0, no render, no comment).
-async function deriveTask(event) {
+/** The PR content Ducky derives from, gathered on EVERY self-render path,
+ *  explicit-task runs included: derive also supplies the description and
+ *  claims the PR comment shows, so an explicit task must never buy a
+ *  claimless comment. A very large PR (GitHub withholds the diff with a 406)
+ *  derives from title and description alone. */
+async function gatherPrContent(event) {
   let title = event.pull_request?.title;
   let body = event.pull_request?.body || undefined;
   if (!title) {
@@ -365,28 +372,40 @@ async function deriveTask(event) {
       body = pr.body || undefined;
     }
   }
-  if (!title) fail("no task input and no PR title found. Set `task`, or run on a pull_request event.");
+  if (!title) fail("no PR title found. Run on a pull_request event, or push a merged PR's commit.");
 
   const diffRes = await gh(`/repos/${REPO}/pulls/${PR}`, "application/vnd.github.diff");
-  if (!diffRes.ok) fail(`fetching the PR diff failed (${diffRes.status}). Does the workflow grant 'contents: read'?`);
-  const diff = (await diffRes.text()).slice(0, 6_000);
-
-  console.log("Ducky: no task set, deriving one from the PR");
-  const res = await fetch(`${API}/v1/derive`, {
-    method: "POST",
-    // Read-only server work (no render is created), so an abort is safe.
-    signal: AbortSignal.timeout(120_000),
-    headers: { Authorization: `Bearer ${KEY}`, "content-type": "application/json" },
-    body: JSON.stringify({ title: title.slice(0, 300), body: body?.slice(0, 10_000), diff, url: URL_ }),
-  });
-  if (!res.ok) fail(`task derivation failed (${res.status}): ${(await res.text()).slice(0, 300)}`);
-  const verdict = await res.json();
-  if (!verdict.demoable) {
-    console.log(`Ducky: nothing user-visible to demo in this PR, skipping. (${verdict.reason ?? "no reason given"})`);
-    process.exit(0);
+  let diff;
+  if (diffRes.ok) {
+    diff = (await diffRes.text()).slice(0, 6_000);
+  } else if (diffRes.status === 406) {
+    console.log("Ducky: GitHub withheld the diff (very large PR); deriving from the title and description.");
+  } else {
+    fail(`fetching the PR diff failed (${diffRes.status}). Does the workflow grant 'contents: read'?`);
   }
-  console.log(`Ducky: derived task: ${verdict.task}`);
-  return verdict.task;
+  return { title: title.slice(0, 300), body: body?.slice(0, 10_000), diff };
+}
+
+/** The server-composed comment for a terminal render: {outcome, post, body}.
+ *  The whole union is validated, and null answers every fetch or shape
+ *  failure, so a malformed response can neither post garbage nor flip the
+ *  exit code: the caller falls back to exiting honestly by render status. */
+const COMMENT_OUTCOMES = ["ready", "held", "failed", "skipped", "pending"];
+async function fetchComposedComment(id) {
+  try {
+    const res = await fetch(`${API}/v1/renders/${id}/comment`, {
+      headers: { Authorization: `Bearer ${KEY}` },
+      signal: AbortSignal.timeout(30_000),
+    });
+    if (!res.ok) return null;
+    const out = await res.json().catch(() => null);
+    if (!out || !COMMENT_OUTCOMES.includes(out.outcome)) return null;
+    if (typeof out.post !== "boolean") return null;
+    if (out.post && (typeof out.body !== "string" || !out.body)) return null;
+    return out;
+  } catch {
+    return null;
+  }
 }
 
 async function main() {
@@ -410,22 +429,36 @@ async function main() {
     PR = await resolvePr(sha);
     console.log(`Ducky: resolved PR #${PR} from ${sha.slice(0, 7)}`);
   }
-  if (!TASK) TASK = await deriveTask(event);
+  const content = await gatherPrContent(event);
 
-  // 1) submit the render
+  // 1) one call: the server derives from the PR content and enqueues with the
+  // description and claims the comment will show. A judged no-demo creates no
+  // render and costs nothing.
   console.log(`Ducky: rendering ${URL_}`);
-  const subRes = await fetch(`${API}/v1/renders`, {
+  // Deliberately NO abort signal, the same call-shape decision as the App
+  // handoff above: the server derives and enqueues before answering, so a
+  // client-side abort could fire after the render exists, orphaning it red
+  // and inviting a duplicate on rerun. A slow answer beats a duplicate.
+  const subRes = await fetch(`${API}/v1/renders/from-pr`, {
     method: "POST",
-    // Plain enqueue, no server-side derive: a minute is already generous.
-    signal: AbortSignal.timeout(60_000),
     headers: { Authorization: `Bearer ${KEY}`, "content-type": "application/json" },
     body: JSON.stringify({
-      url: URL_, task: TASK, reel: REEL, source: "github_pr",
+      url: URL_, title: content.title, reel: REEL,
+      ...(content.body ? { body: content.body } : {}),
+      ...(content.diff ? { diff: content.diff } : {}),
+      ...(TASK ? { task: TASK } : {}),
       ...(CREDENTIAL ? { credential: CREDENTIAL } : {}),
       ...(VERCEL_BYPASS ? { vercel_bypass: VERCEL_BYPASS } : {}),
       ...(LOGIN_HINTS.length ? { login_hints: LOGIN_HINTS } : {}),
     }),
   });
+  if (subRes.status === 200) {
+    // Judged no-demo: no render exists, nothing to poll, nothing to post.
+    const out = await subRes.json().catch(() => null);
+    if (!out || out.status !== "skipped") fail("render submit answered an unexpected body");
+    console.log(`Ducky: nothing user-visible to demo in this PR, skipping. (${out.reason ?? "no reason given"})`);
+    process.exit(0);
+  }
   if (!subRes.ok) fail(`render submit failed (${subRes.status}): ${(await subRes.text()).slice(0, 300)}`);
   const sub = await subRes.json().catch(() => null);
   if (!sub || typeof sub.id !== "string" || !sub.id) fail("render submit answered an unexpected body");
@@ -457,27 +490,25 @@ async function main() {
       : `Ducky: render ${sub.id} still running at render-timeout (${RENDER_TIMEOUT_S}s); could not post the note (does the workflow grant 'permissions: pull-requests: write'?). Check the dashboard for the result.`);
     process.exit(0);
   }
-  if (!DONE.includes(final.status)) fail(`render ${final.status}`);
-  const video = final.reel_url || final.demo_url;
-  if (!video) fail("render finished but produced no video");
-
-  // 3) post the PR comment via the GitHub REST API (JSON body, no shell escaping)
-  // With a GIF preview: the animated image IS the link (external images embed
-  // inline on GitHub; external videos never do). Without one: plain link.
-  const watch = final.preview_url
-    ? `[![Watch the demo](${final.preview_url})](${video})\n\n▶️ **[Watch the full demo](${video})**`
-    : `▶️ **[Watch the demo](${video})**`;
-  const body = [
-    "🦆 **Ducky: demo of this change**",
-    "",
-    `**Task:** ${TASK}`,
-    "",
-    watch,
-    "",
-    '<sub>Auto-generated by <a href="https://tryducky.dev">Ducky</a>.</sub>',
-  ].join("\n");
-  await postComment(body);
-  console.log(`Ducky: posted demo to PR #${PR}`);
+  // 3) post the comment the server composed for this row: identical builders
+  // to the App path, so held renders get the held note (and no video link),
+  // failures get the failure note, and verified demos get the full body.
+  const comment = await fetchComposedComment(sub.id);
+  if (!comment) {
+    // The render is terminal but its comment can't be had; exit honestly by
+    // render status rather than inventing a body client-side. A skipped
+    // render is green everywhere else, so it is green here too.
+    console.log(`Ducky: could not fetch the composed comment for ${sub.id}; no comment posted. See the dashboard.`);
+    if (!DONE.includes(final.status) && final.status !== "skipped") fail(`render ${final.status}`);
+    process.exit(0);
+  }
+  if (comment.post && typeof comment.body === "string" && comment.body) {
+    await postComment(comment.body);
+    console.log(`Ducky: posted the ${comment.outcome} comment to PR #${PR}`);
+  } else {
+    console.log(`Ducky: ${comment.outcome}; nothing to post.`);
+  }
+  if (comment.outcome === "failed") fail(`render failed; details are on the PR and the dashboard`);
 }
 
 main().catch((e) => fail(e?.message ?? String(e)));

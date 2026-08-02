@@ -34,7 +34,7 @@ Open a pull request: Ducky waits for the PR's preview deployment, reads the PR t
 
 ## Also using the Ducky GitHub App?
 
-If the [Ducky GitHub App](https://tryducky.dev) is installed on the repo, the action hands the render to the App instead of rendering twice: one render, one comment, posted by the App with its full verification detail. The action keeps the CI signal (the check goes red if the render fails within `render-timeout`; a render that outlives the budget leaves a green check and finishes on the dashboard). Repos without the App keep the action's own comment, exactly as before. Nothing to configure either way.
+If the [Ducky GitHub App](https://tryducky.dev) is installed on the repo, the action hands the render to the App instead of rendering twice: one render, one comment, posted by the App with its full verification detail. The action keeps the CI signal (the check goes red if the render fails within `render-timeout`; a render that outlives the budget leaves a green check and finishes on the dashboard). Repos without the App render through the action, which posts the comment Ducky composes for the result: the verified demo with its proof detail, or an honest note when verification held the demo back, the render failed, or there was nothing to show. Nothing to configure either way.
 
 ## Pointing Ducky at the right URL
 
@@ -70,7 +70,7 @@ on:
 |-------|----------|---------|-------------|
 | `api-key` | Yes | (none) | Your Ducky API key (use a repository secret). |
 | `url` | No | the PR's preview deployment | The deployed URL to demo. When omitted, Ducky waits for this commit's deployment via GitHub and uses its URL. |
-| `task` | No | derived from the PR | Force what to show, e.g. `"Sign up for a new account"`. When omitted, Ducky derives it from the PR's title, description, and diff. |
+| `task` | No | derived from the PR | Force what to show, e.g. `"Sign up for a new account"`. Ducky always reads the PR (title, description, diff; `contents: read` stays required) to judge and describe the change; this input overrides only the demo objective. |
 | `reel` | No | `true` | Post the polished narrated reel, or the raw screen recording. |
 | `wait-timeout` | No | `300` | Seconds to wait for the deployment when `url` is omitted. |
 | `render-timeout` | No | `600` | Seconds to watch the render before the step moves on. Set `0` to submit and not wait. The demo still finishes server-side; without the App installed, the step leaves a note on the PR instead of the video. |

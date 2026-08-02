@@ -21,7 +21,7 @@ inputs:
     required: false
     default: '600'
   task:
-    description: 'What to demonstrate, e.g. "Show the new checkout flow". Optional. When omitted, Ducky reads the PR (title, description, diff) and derives what to demo.'
+    description: 'What to demonstrate, e.g. "Show the new checkout flow". Optional. Ducky always reads the PR (title, description, diff) to judge and describe the change; this input overrides only the demo objective.'
     required: false
   reel:
     description: 'Produce the polished narrated reel (true) or just the raw demo (false).'
