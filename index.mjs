@@ -50,6 +50,8 @@ const RENDER_TIMEOUT_S = Number.isFinite(parsedRenderTimeout) ? Math.max(0, pars
 // Clamped to >=1ms so a bad value can never become a zero-delay hot loop.
 const POLL_INTERVAL_MS = Math.max(1, parseInt(env.POLL_INTERVAL_MS || "", 10) || 20_000);
 const DEPLOY_POLL_MS = Math.max(1, parseInt(env.DEPLOY_POLL_MS || "", 10) || 10_000);
+// test-harness override like the two above; production always derives from WAIT_TIMEOUT
+const WAIT_TIMEOUT_MS = parseInt(env.WAIT_TIMEOUT_MS || "", 10) || WAIT_TIMEOUT_S * 1000;
 const DONE = ["done", "succeeded", "completed"];
 const TERMINAL = [...DONE, "failed", "error", "cancelled", "skipped"];
 
@@ -160,7 +162,7 @@ async function resolvePr(sha) {
 const newestFirst = (a, b) =>
   String(b.created_at ?? "").localeCompare(String(a.created_at ?? "")) || ((b.id ?? 0) - (a.id ?? 0));
 
-async function selectDeploymentUrl(sha, deadline) {
+async function selectDeploymentUrl(sha, deadline, seen = {}) {
   let raw;
   try {
     const dRes = await gh(`/repos/${REPO}/deployments?sha=${sha}&per_page=20`);
@@ -188,6 +190,9 @@ async function selectDeploymentUrl(sha, deadline) {
     statuses.sort(newestFirst);
     const current = statuses[0];
     if (current?.state === "success" && current.environment_url) return current.environment_url;
+    // A currently-failed deploy is a different diagnosis than "never deployed":
+    // remember it so the timeout message can say what actually happened.
+    if (current?.state === "failure" || current?.state === "error") seen.failed = true;
     if (!retired) {
       retired = statuses.find((s) => s.state === "success" && s.environment_url)?.environment_url ?? null;
     }
@@ -198,15 +203,19 @@ async function selectDeploymentUrl(sha, deadline) {
 /** Wait for a deployment of `sha` that advertises its URL, and return it. */
 async function waitForDeployment(sha) {
   console.log(`Ducky: no url set, waiting for a deployment of ${sha.slice(0, 7)} (timeout ${WAIT_TIMEOUT_S}s)`);
-  const deadline = Date.now() + WAIT_TIMEOUT_S * 1000;
+  const deadline = Date.now() + WAIT_TIMEOUT_MS;
+  const seen = {};
   for (;;) {
-    const url = await selectDeploymentUrl(sha, deadline);
+    const url = await selectDeploymentUrl(sha, deadline, seen);
     if (url) {
       console.log(`Ducky: deployment ready, ${url}`);
       return url;
     }
     if (Date.now() >= deadline) break;
     await sleep(DEPLOY_POLL_MS);
+  }
+  if (seen.failed) {
+    fail(`the deploy of ${sha.slice(0, 7)} FAILED on your host, so there is no URL to record. Fix the deploy and re-run this workflow.`);
   }
   fail(`no deployment of ${sha.slice(0, 7)} advertised a URL within ${WAIT_TIMEOUT_S}s. Pass \`url\` explicitly, raise \`wait-timeout\`, or check the deploy. (Hosts that don't report deployments to GitHub, like Netlify or Cloudflare Pages, need an explicit \`url\`.)`);
 }

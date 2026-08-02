@@ -288,6 +288,20 @@ test("no url input: waits for the deployment, then hands its URL to the trigger"
   );
 });
 
+test("no url input and the only deploy FAILED: red check says the deploy failed, not 'no URL'", () => {
+  const { code, out } = runAction({
+    event: prEvent,
+    env: { RENDER_URL: "", WAIT_TIMEOUT_MS: "60" },
+    spec: [
+      { url: `/deployments?sha=${SHA}`, json: [{ id: 51 }] },
+      { url: "/deployments/51/statuses", json: [{ state: "failure", environment_url: "https://dead.example.test" }] },
+    ],
+  });
+  assert.equal(code, 1, out);
+  assert.match(out, /FAILED on your host/);
+  assert.ok(!out.includes("advertised a URL"), "the generic no-URL copy must not show for a failed deploy");
+});
+
 test("handoff path resolves no PR and derives nothing: zero commits/pulls or derive calls", () => {
   const { requests, code, out } = runAction({
     event: prEvent,
