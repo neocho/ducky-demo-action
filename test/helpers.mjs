@@ -35,6 +35,9 @@ export function runAction({ spec = [], env = {}, event = {} } = {}) {
         GITHUB_EVENT_PATH: eventPath,
         GITHUB_EVENT_NAME: "pull_request",
         GITHUB_SHA: SHA,
+        // action.yml maps the PR number in from the event on pull_request
+        // runs; push runs get an empty string, so they resolve it themselves.
+        PR_NUMBER: "12",
         // 1ms polls; a 30s default render budget keeps happy-path tests off
         // the expiry branch even on a stalled runner. Expiry-shaped cases set
         // RENDER_TIMEOUT to "0"/"1" explicitly.
