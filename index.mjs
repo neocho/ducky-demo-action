@@ -431,7 +431,10 @@ async function gatherPrContent(event) {
       body = pr.body || undefined;
     }
   }
-  if (!title) fail(`could not read PR #${PR} for its title. Does the workflow grant 'contents: read'?`);
+  // Title, description, and diff all come from the pull request endpoints, so
+  // the grant they need is `pull-requests` (the quick start's
+  // `pull-requests: write`, for the comment, already includes the read).
+  if (!title) fail(`could not read PR #${PR} for its title. Does the workflow grant 'permissions: pull-requests: read'?`);
 
   const diffRes = await gh(`/repos/${REPO}/pulls/${PR}`, "application/vnd.github.diff");
   let diff;
@@ -440,7 +443,7 @@ async function gatherPrContent(event) {
   } else if (diffRes.status === 406) {
     console.log("Ducky: GitHub withheld the diff (very large PR); deriving from the title and description.");
   } else {
-    fail(`fetching the PR diff failed (${diffRes.status}). Does the workflow grant 'contents: read'?`);
+    fail(`fetching the PR diff failed (${diffRes.status}). Does the workflow grant 'permissions: pull-requests: read'?`);
   }
   return { title: title.slice(0, 300), body: body?.slice(0, 10_000), diff };
 }
@@ -471,6 +474,15 @@ async function main() {
   const event = readEvent();
   if (isForkPr(event)) {
     console.log("Ducky: PR from a fork, skipping (fork runs have no secrets and no write permission by design; nothing rendered).");
+    process.exit(0);
+  }
+  // A pull_request run names its PR in the event, so the open-only rule that
+  // guards push resolution never sees it. Without this, a workflow that also
+  // fires on `closed` would read the PR, sit through a deployment wait, and
+  // demo a pull request nobody can review any more. Only an explicit "closed"
+  // skips: a payload that doesn't state its status isn't claiming one.
+  if (event.pull_request?.state === "closed") {
+    console.log(`Ducky: pull request #${event.pull_request.number ?? PR} is closed, skipping (Ducky demos open pull requests).`);
     process.exit(0);
   }
   if (!KEY) fail("missing required input: api-key");

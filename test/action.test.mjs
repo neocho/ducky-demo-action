@@ -13,7 +13,10 @@ import { API, SHA, bodyOf, hits, runAction, SHA as FULL_SHA } from "./helpers.mj
 const TRIGGER = "/v1/github/trigger/octo-org/widget-app";
 const COMPOSED_BODY = "### 🦆 Ducky demo\n\ncomposed by the server";
 
-const prEvent = { pull_request: { number: 12, head: { sha: SHA, repo: { full_name: "octo-org/widget-app" } } } };
+// An explicitly open PR, so every case below also pins that a stated "open"
+// runs normally; the bespoke events elsewhere state no status at all, which
+// must run normally too.
+const prEvent = { pull_request: { number: 12, state: "open", head: { sha: SHA, repo: { full_name: "octo-org/widget-app" } } } };
 // A push run carries no PR in context (action.yml maps nothing there), so it
 // resolves one from the commit.
 const pushEnv = { GITHUB_EVENT_NAME: "push", PR_NUMBER: "" };
@@ -521,6 +524,21 @@ test("push: a direct-to-main commit with no PR at all still exits 0 quietly", ()
   assert.equal(code, 0, out);
   assert.match(out, /direct push, nothing to demo/);
   assertIntakes(requests, 0);
+});
+
+test("pull_request: a closed PR skips before reading it, waiting on a deploy, or submitting anything", () => {
+  const { code, out, requests } = runAction({
+    // The event names the PR, so nothing resolves it and nothing else would
+    // notice it is closed. No `url` either: an early exit is the only way this
+    // makes zero requests.
+    event: { pull_request: { number: 12, state: "closed", head: { sha: SHA, repo: { full_name: "octo-org/widget-app" } } } },
+    env: { RENDER_URL: "" },
+    spec: [],
+  });
+  assert.equal(code, 0, out);
+  assert.match(out, /pull request #12 is closed/);
+  assert.match(out, /Ducky demos open pull requests/);
+  assert.equal(requests.length, 0, `a closed PR must render nothing, but it requested: ${requests.map((r) => r.url).join(" , ")}`);
 });
 
 test("pull_request: the PR comes from the event context, so no commit lookup runs", () => {
