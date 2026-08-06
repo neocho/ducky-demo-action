@@ -1,25 +1,26 @@
 // Ducky Demo Action runtime.
 //
 // Reads inputs from env (mapped by action.yml), renders a demo via the Ducky
-// API, and posts the video as a PR comment.
-//   - Repos covered by the Ducky GitHub App hand the render to the App
-//     (POST /v1/github/trigger/{owner}/{name}): one render, one comment,
-//     posted by the App with its full verification detail. The Action keeps
-//     the CI signal: it polls the render and the check goes red on a failure
-//     within render-timeout.
-//   - Repos without the App (or pushes the App can't serve, like a merge
-//     commit with no open PR) render and post from the Action itself.
+// API, and makes sure the demo reaches the PR.
+//   - ONE intake call per run: POST /v1/github/trigger/{owner}/{name}, always
+//     carrying the PR's title/body/diff. The server resolves the repo and
+//     DECLARES who owns the output in `mode`; the Action never infers that
+//     from an error, so a hiccup can no longer look like "no App here".
+//   - `mode: "app"`: the Ducky GitHub App renders and posts the comment
+//     itself, with its full verification detail. This run keeps only the CI
+//     signal: it polls the render and the check goes red on a failure within
+//     render-timeout.
+//   - `mode: "action"`: the render belongs to this run. Poll it, ask the
+//     server for the composed comment, and post it verbatim, so it reads
+//     exactly like the App's: verified demos, held notes, failure notes.
+//   - A 200 skip is terminal whatever its reason (nothing was rendered and
+//     nothing will be). Everything else, 400 / 401 / 429 / 5xx / network / a
+//     mode this release doesn't know, is a red check. No path renders twice.
 //   - No `url` input → waits for this commit's deployment (GitHub deployments
 //     API) and renders its environment_url, so the demo always shows the PR's
 //     actual code.
-//   - Self-rendering ships the PR's title/body/diff with the render request;
-//     Ducky derives what to demo (an explicit `task` input overrides only the
-//     objective), or says nothing user-visible changed (clean skip). The PR
-//     comment itself is composed by the server and posted verbatim, so it
-//     matches what the Ducky GitHub App would post: verified demos, held
-//     notes, failure notes, skip notes.
 //   - Works on pull_request AND push events (the PR is resolved from the
-//     commit when it's not in the event context).
+//     commit when it's not in the event context). Open PRs only.
 
 import { readFileSync } from "node:fs";
 
@@ -55,12 +56,12 @@ const WAIT_TIMEOUT_MS = parseInt(env.WAIT_TIMEOUT_MS || "", 10) || WAIT_TIMEOUT_
 const DONE = ["done", "succeeded", "completed"];
 const TERMINAL = [...DONE, "failed", "error", "cancelled", "skipped"];
 
-// The commit dedup on the handoff compares full shas server-side, so an
+// The commit dedup on the intake call compares full shas server-side, so an
 // abbreviated sha would dedup nothing; only send the flag when it can work.
 const FULL_SHA_RE = /^[0-9a-f]{40}$/i;
-// The server's no-open-PR skip reason (matched exactly; `code` wins when the
-// server sends one). Anything else skipped means the App owned the outcome.
-const NO_OPEN_PR_REASON = "no open PR has this commit at its head";
+// Who owns the output of an accepted render. The server says which; a mode
+// this release doesn't know is a version mismatch, never a guess.
+const MODES = ["app", "action"];
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -120,26 +121,25 @@ async function postComment(bodyText, { bestEffort = false } = {}) {
   return cRes.ok;
 }
 
-/** Resolve the PR to comment on from the commit (push events have no PR in
- *  context; works for merged PRs too). Only the self-render path needs a PR:
- *  the handoff posts nothing, so it never calls this. */
+/** Resolve the PR to demo from the commit (push events have no PR in
+ *  context). OPEN PRs only: a demo belongs on a pull request while it is being
+ *  reviewed, so a commit whose PRs have all merged or closed has nothing to
+ *  show. Nothing open anywhere is a quiet skip (exit 0), never a red x. */
 async function resolvePr(sha) {
   const res = await gh(`/repos/${REPO}/commits/${sha}/pulls`);
   if (!res.ok) fail(`resolving the PR for ${sha.slice(0, 7)} failed (${res.status})`);
   const prs = await res.json().catch(() => null);
   if (!Array.isArray(prs)) fail(`resolving the PR for ${sha.slice(0, 7)} answered an unexpected body`);
-  if (!prs.length) {
-    // A direct-to-main push with no associated PR has nothing to demo. Only push
-    // events reach here (pull_request events carry their own PR), so skip quietly
-    // (neutral, exit 0) instead of erroring with a red ✗ on every such commit.
-    if (env.GITHUB_EVENT_NAME === "push") {
-      console.log(`Ducky: no pull request for ${sha.slice(0, 7)}, skipping (direct push, nothing to demo).`);
-      process.exit(0);
-    }
-    fail("no pull request found for this commit. Run on a PR event, or push a merged PR's commit.");
-  }
   const open = prs.find((p) => p.state === "open");
-  return String((open ?? prs[0]).number);
+  if (open) return String(open.number);
+  if (!prs.length) {
+    console.log(env.GITHUB_EVENT_NAME === "push"
+      ? `Ducky: no pull request for ${sha.slice(0, 7)}, skipping (direct push, nothing to demo).`
+      : `Ducky: no pull request has ${sha.slice(0, 7)}, skipping (Ducky demos open pull requests).`);
+  } else {
+    console.log(`Ducky: no OPEN pull request has ${sha.slice(0, 7)}, skipping (Ducky demos open pull requests).`);
+  }
+  process.exit(0);
 }
 
 /** One selection pass over the deployments recorded for `sha`. The rule:
@@ -260,24 +260,23 @@ async function pollRender(id) {
   }
 }
 
-/** Offer the render to the Ducky GitHub App. When the App can serve this repo
- *  and commit, it renders and posts the comment itself; this function then
- *  owns the outcome and EXITS (0 on done/skipped, 1 on failed), posting
- *  nothing. It returns only when the Action should self-render instead:
- *  no covering App install (403/404), no open PR at this commit (the App
- *  can't comment, but the Action can, it resolves merged PRs too), or the
- *  trigger endpoint erroring (5xx / network). A 429 means the daily render
- *  cap: same red check as the self-render path. */
-async function tryAppHandoff(sha) {
+/** The one PR intake call. It always carries the PR content, so a repo the
+ *  Ducky GitHub App doesn't cover renders from the same request instead of a
+ *  second one, and the server never has to answer an error to say "not mine".
+ *  Returns {renderId, mode, prNumber} for an accepted render; a well-formed
+ *  skip is terminal and exits 0 here; everything else is a red check. There is
+ *  no fallback: an intake that fails renders nothing, and the workflow re-run
+ *  button is the retry. */
+async function triggerRender(sha, content) {
   const [owner, name] = (REPO || "").split("/");
-  if (!owner || !name) return { fallback: "no repository in context" };
+  if (!owner || !name) fail("no repository in context. Run this action in a GitHub Actions workflow.");
 
   let res;
   try {
     // Deliberately NO abort signal on this one call: the server resolves,
     // derives, and enqueues before answering, so a client-side abort could
-    // fire after the App's render exists, and the fallback would then render
-    // and comment a second time. A slow answer beats a duplicate.
+    // fire after the render exists, orphaning it red and inviting a duplicate
+    // on re-run. A slow answer beats a duplicate.
     res = await fetch(`${API}/v1/github/trigger/${encodeURIComponent(owner)}/${encodeURIComponent(name)}`, {
       method: "POST",
       headers: { Authorization: `Bearer ${KEY}`, "content-type": "application/json" },
@@ -285,6 +284,9 @@ async function tryAppHandoff(sha) {
         sha,
         url: URL_,
         reel: REEL,
+        title: content.title,
+        ...(content.body ? { body: content.body } : {}),
+        ...(content.diff ? { diff: content.diff } : {}),
         // Best-effort: a deploy webhook may already have rendered this commit.
         ...(FULL_SHA_RE.test(sha) ? { dedup: true } : {}),
         ...(TASK ? { task: TASK } : {}),
@@ -294,8 +296,7 @@ async function tryAppHandoff(sha) {
       }),
     });
   } catch (e) {
-    console.log(`Ducky: trigger unreachable (${e?.message ?? e}), falling back to rendering from the Action.`);
-    return { fallback: "trigger unreachable" };
+    fail(`Ducky is unreachable (${e?.message ?? e}); nothing was rendered. Re-run this workflow to retry.`);
   }
 
   if (res.status === 202) {
@@ -303,72 +304,121 @@ async function tryAppHandoff(sha) {
     // A 202 without a render id would poll nothing into a false green; treat
     // a malformed acceptance as a hard error instead.
     if (!out || typeof out.render_id !== "string" || !out.render_id) {
-      fail(`trigger accepted the handoff but answered an unexpected body: ${JSON.stringify(out)?.slice(0, 200) ?? "not JSON"}`);
+      fail(`the render was accepted but the answer was unexpected: ${JSON.stringify(out)?.slice(0, 200) ?? "not JSON"}`);
     }
-    console.log(`Ducky: handed off to the Ducky GitHub App, render ${out.render_id}${out.pr_number ? ` (PR #${out.pr_number})` : ""}. The App posts the comment when it finishes.`);
-    const { render: final, observed } = await pollRender(out.render_id);
-    if (!final) {
-      if (!observed) {
-        // Every poll failed: we never saw the render at all, so "the App will
-        // post" is an assumption, not an observation. Go red.
-        fail(`handed off render ${out.render_id} but could not read its status even once`);
-      }
-      // The App posts whenever the render finishes, with or without us; an
-      // expired poll is not a failure, so don't turn the check red for it.
-      console.log(`Ducky: render ${out.render_id} still running when the poll budget expired. Final result lands on the PR and the dashboard.`);
-      process.exit(0);
+    // Who posts the comment is the server's call. Inferring it is exactly the
+    // habit this contract removes, so an absent or unknown mode is loud.
+    if (!MODES.includes(out.mode)) {
+      fail(`the render was accepted with an unknown mode (${JSON.stringify(out.mode) ?? "none"}), so who posts the comment is undefined. This action is out of step with the Ducky API; update to the latest release.`);
     }
-    if (!DONE.includes(final.status) && final.status !== "skipped") {
-      fail(`render ${final.status} (render ${out.render_id})`);
-    }
-    console.log(`Ducky: render ${out.render_id} finished (${final.status}), comment posted by the Ducky GitHub App.`);
-    process.exit(0);
+    return { renderId: out.render_id, mode: out.mode, prNumber: out.pr_number };
   }
 
   if (res.status === 200) {
     const out = await res.json().catch(() => null);
-    // Only a well-formed skip is App-owned; anything else malformed on a 200
-    // must not silently become a green check with no render anywhere.
+    // Only a well-formed skip is a skip; anything else malformed on a 200 must
+    // not silently become a green check with no render anywhere.
     if (!out || out.status !== "skipped" || typeof out.reason !== "string") {
       fail(`unexpected trigger response (200): ${JSON.stringify(out)?.slice(0, 200) ?? "not JSON"}`);
     }
-    // When the server sends a machine-readable code it decides alone; the
-    // exact reason-string match only covers servers that predate the field.
-    const noOpenPr = out.code != null ? out.code === "no_open_pr" : out.reason === NO_OPEN_PR_REASON;
-    if (noOpenPr) {
-      console.log("Ducky: the App found no open PR at this commit, rendering from the Action (covers merged PRs).");
-      return { fallback: "no open PR" };
-    }
-    // Everything else skipped is App-owned: a not-demoable change (the App
-    // posts the skip note) or a commit already rendered (dedup).
-    console.log(`Ducky: skipped by the Ducky GitHub App: ${out.reason}${out.render_id ? ` (${out.render_id})` : ""}.`);
+    // Every skip is terminal: nothing was rendered, and nothing will be. The
+    // reason is the whole story (not demoable, no open PR, already rendered).
+    console.log(`Ducky: skipped: ${out.reason}${out.render_id ? ` (${out.render_id})` : ""}.`);
     process.exit(0);
   }
 
   if (res.status === 401) {
     fail(`Ducky API key rejected (401): ${(await res.text()).slice(0, 200)}`);
   }
-  if (res.status === 403 || res.status === 404) {
-    console.log("Ducky: this repo isn't covered by a Ducky GitHub App install for this API key, rendering from the Action.");
-    return { fallback: `no covering install (${res.status})` };
-  }
   if (res.status === 429) {
-    fail(`render rejected (429): ${(await res.text()).slice(0, 200)}`);
+    fail(`render rejected (429): ${(await res.text()).slice(0, 200)}. Re-run this workflow once the cap resets.`);
   }
   if (res.status >= 500) {
-    console.log(`Ducky: trigger failed (${res.status}), falling back to rendering from the Action.`);
-    return { fallback: `trigger ${res.status}` };
+    fail(`Ducky answered ${res.status}; nothing was rendered. Re-run this workflow to retry: ${(await res.text()).slice(0, 200)}`);
   }
-  // 400s other than the handled set are caller bugs; surface them loudly
-  // rather than masking them behind a second, differently-shaped failure.
-  fail(`handoff rejected (${res.status}): ${(await res.text()).slice(0, 300)}`);
+  // 400s and anything else unhandled are caller-side bugs; surface them
+  // loudly rather than masking them behind a second, differently-shaped run.
+  fail(`render request rejected (${res.status}): ${(await res.text()).slice(0, 300)}`);
 }
 
-/** The PR content Ducky derives from, gathered on EVERY self-render path,
- *  explicit-task runs included: derive also supplies the description and
- *  claims the PR comment shows, so an explicit task must never buy a
- *  claimless comment. A very large PR (GitHub withholds the diff with a 406)
- *  derives from title and description alone. */
+/** `mode: "app"`: the Ducky GitHub App owns this render and posts the comment
+ *  with its full verification detail. This run posts nothing and keeps only
+ *  the CI signal, so it polls and exits (0 on done/skipped, 1 on failed). */
+async function awaitAppComment(renderId, prNumber) {
+  console.log(`Ducky: the Ducky GitHub App owns render ${renderId}${prNumber ? ` (PR #${prNumber})` : ""}. It posts the comment when it finishes.`);
+  const { render: final, observed } = await pollRender(renderId);
+  if (!final) {
+    if (!observed) {
+      // Every poll failed: we never saw the render at all, so "the App will
+      // post" is an assumption, not an observation. Go red.
+      fail(`render ${renderId} was accepted but could not read its status even once`);
+    }
+    // The App posts whenever the render finishes, with or without us; an
+    // expired poll is not a failure, so don't turn the check red for it.
+    console.log(`Ducky: render ${renderId} still running when the poll budget expired. Final result lands on the PR and the dashboard.`);
+    process.exit(0);
+  }
+  if (!DONE.includes(final.status) && final.status !== "skipped") {
+    fail(`render ${final.status} (render ${renderId})`);
+  }
+  console.log(`Ducky: render ${renderId} finished (${final.status}), comment posted by the Ducky GitHub App.`);
+  process.exit(0);
+}
+
+/** `mode: "action"`: the render belongs to this run, so poll it and post the
+ *  comment the server composed for the row: identical builders to the App
+ *  path, so held renders get the held note (and no video link), failures get
+ *  the failure note, and verified demos get the full body. */
+async function renderAndComment(renderId) {
+  console.log(`Ducky: render ${renderId} queued`);
+  const { render: final, observed } = await pollRender(renderId);
+  if (!final && !observed) {
+    // Every poll failed: nothing about this render was ever read, so a polite
+    // "still rendering" note would be an invention. Go red.
+    fail(`render ${renderId} was submitted but its status could not be read even once`);
+  }
+  if (!final) {
+    // The render finishes server-side with or without us. Leave a note whose
+    // past-tense wording stays true whatever the outcome (no marker, no later
+    // edit; a re-run of an expired job stacks a second note, accepted).
+    const posted = await postComment(
+      [
+        "🦆 **Ducky**",
+        "",
+        `The demo was still rendering when this check finished (waited ${RENDER_TIMEOUT_S}s). Check the [Ducky dashboard](https://tryducky.dev) for the result.`,
+        "",
+        '<sub>Auto-generated by <a href="https://tryducky.dev">Ducky</a>.</sub>',
+      ].join("\n"),
+      { bestEffort: true },
+    );
+    console.log(posted
+      ? `Ducky: render ${renderId} still running at render-timeout (${RENDER_TIMEOUT_S}s); left a note, check the dashboard for the result.`
+      : `Ducky: render ${renderId} still running at render-timeout (${RENDER_TIMEOUT_S}s); could not post the note (does the workflow grant 'permissions: pull-requests: write'?). Check the dashboard for the result.`);
+    process.exit(0);
+  }
+  const comment = await fetchComposedComment(renderId);
+  if (!comment) {
+    // The render is terminal but its comment can't be had; exit honestly by
+    // render status rather than inventing a body client-side. A skipped
+    // render is green everywhere else, so it is green here too.
+    console.log(`Ducky: could not fetch the composed comment for ${renderId}; no comment posted. See the dashboard.`);
+    if (!DONE.includes(final.status) && final.status !== "skipped") fail(`render ${final.status}`);
+    process.exit(0);
+  }
+  if (comment.post && typeof comment.body === "string" && comment.body) {
+    await postComment(comment.body);
+    console.log(`Ducky: posted the ${comment.outcome} comment to PR #${PR}`);
+  } else {
+    console.log(`Ducky: ${comment.outcome}; nothing to post.`);
+  }
+  if (comment.outcome === "failed") fail(`render failed; details are on the PR and the dashboard`);
+}
+
+/** The PR content Ducky derives from, gathered on EVERY run, explicit-task
+ *  runs included: derive also supplies the description and claims the PR
+ *  comment shows, so an explicit task must never buy a claimless comment. A
+ *  very large PR (GitHub withholds the diff with a 406) derives from title and
+ *  description alone. */
 async function gatherPrContent(event) {
   let title = event.pull_request?.title;
   let body = event.pull_request?.body || undefined;
@@ -381,7 +431,10 @@ async function gatherPrContent(event) {
       body = pr.body || undefined;
     }
   }
-  if (!title) fail("no PR title found. Run on a pull_request event, or push a merged PR's commit.");
+  // Title, description, and diff all come from the pull request endpoints, so
+  // the grant they need is `pull-requests` (the quick start's
+  // `pull-requests: write`, for the comment, already includes the read).
+  if (!title) fail(`could not read PR #${PR} for its title. Does the workflow grant 'permissions: pull-requests: read'?`);
 
   const diffRes = await gh(`/repos/${REPO}/pulls/${PR}`, "application/vnd.github.diff");
   let diff;
@@ -390,7 +443,7 @@ async function gatherPrContent(event) {
   } else if (diffRes.status === 406) {
     console.log("Ducky: GitHub withheld the diff (very large PR); deriving from the title and description.");
   } else {
-    fail(`fetching the PR diff failed (${diffRes.status}). Does the workflow grant 'contents: read'?`);
+    fail(`fetching the PR diff failed (${diffRes.status}). Does the workflow grant 'permissions: pull-requests: read'?`);
   }
   return { title: title.slice(0, 300), body: body?.slice(0, 10_000), diff };
 }
@@ -423,101 +476,37 @@ async function main() {
     console.log("Ducky: PR from a fork, skipping (fork runs have no secrets and no write permission by design; nothing rendered).");
     process.exit(0);
   }
+  // A pull_request run names its PR in the event, so the open-only rule that
+  // guards push resolution never sees it. Without this, a workflow that also
+  // fires on `closed` would read the PR, sit through a deployment wait, and
+  // demo a pull request nobody can review any more. Only an explicit "closed"
+  // skips: a payload that doesn't state its status isn't claiming one.
+  if (event.pull_request?.state === "closed") {
+    console.log(`Ducky: pull request #${event.pull_request.number ?? PR} is closed, skipping (Ducky demos open pull requests).`);
+    process.exit(0);
+  }
   if (!KEY) fail("missing required input: api-key");
 
   const sha = headSha(event);
   if (!sha) fail("no commit in context. Run this action on a pull_request or push event.");
-  if (!URL_) URL_ = await waitForDeployment(sha);
 
-  // Offer the render to the Ducky GitHub App first. Exits when the App owns
-  // the outcome; returns when the Action should render it itself.
-  const { fallback } = await tryAppHandoff(sha);
-  console.log(`Ducky: self-rendering (${fallback}).`);
-
+  // The PR and its content are gathered BEFORE the intake call on every event:
+  // the one call always carries them, so a repo without the App renders from
+  // this request instead of a second one. Resolving first also means a commit
+  // with no open PR skips without sitting through a deployment wait.
   if (!PR) {
     PR = await resolvePr(sha);
     console.log(`Ducky: resolved PR #${PR} from ${sha.slice(0, 7)}`);
   }
   const content = await gatherPrContent(event);
 
-  // 1) one call: the server derives from the PR content and enqueues with the
-  // description and claims the comment will show. A judged no-demo creates no
-  // render and costs nothing.
-  console.log(`Ducky: rendering ${URL_}`);
-  // Deliberately NO abort signal, the same call-shape decision as the App
-  // handoff above: the server derives and enqueues before answering, so a
-  // client-side abort could fire after the render exists, orphaning it red
-  // and inviting a duplicate on rerun. A slow answer beats a duplicate.
-  const subRes = await fetch(`${API}/v1/renders/from-pr`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${KEY}`, "content-type": "application/json" },
-    body: JSON.stringify({
-      url: URL_, title: content.title, reel: REEL,
-      ...(content.body ? { body: content.body } : {}),
-      ...(content.diff ? { diff: content.diff } : {}),
-      ...(TASK ? { task: TASK } : {}),
-      ...(CREDENTIAL ? { credential: CREDENTIAL } : {}),
-      ...(VERCEL_BYPASS ? { vercel_bypass: VERCEL_BYPASS } : {}),
-      ...(LOGIN_HINTS.length ? { login_hints: LOGIN_HINTS } : {}),
-    }),
-  });
-  if (subRes.status === 200) {
-    // Judged no-demo: no render exists, nothing to poll, nothing to post.
-    const out = await subRes.json().catch(() => null);
-    if (!out || out.status !== "skipped") fail("render submit answered an unexpected body");
-    console.log(`Ducky: nothing user-visible to demo in this PR, skipping. (${out.reason ?? "no reason given"})`);
-    process.exit(0);
-  }
-  if (!subRes.ok) fail(`render submit failed (${subRes.status}): ${(await subRes.text()).slice(0, 300)}`);
-  const sub = await subRes.json().catch(() => null);
-  if (!sub || typeof sub.id !== "string" || !sub.id) fail("render submit answered an unexpected body");
-  console.log(`Ducky: render ${sub.id} queued`);
+  if (!URL_) URL_ = await waitForDeployment(sha);
 
-  // 2) poll to a terminal state
-  const { render: final, observed } = await pollRender(sub.id);
-  if (!final && !observed) {
-    // Every poll failed: nothing about this render was ever read, so a polite
-    // "still rendering" note would be an invention. Go red.
-    fail(`render ${sub.id} was submitted but its status could not be read even once`);
-  }
-  if (!final) {
-    // The render finishes server-side with or without us. Leave a note whose
-    // past-tense wording stays true whatever the outcome (no marker, no later
-    // edit; a re-run of an expired job stacks a second note, accepted).
-    const posted = await postComment(
-      [
-        "🦆 **Ducky**",
-        "",
-        `The demo was still rendering when this check finished (waited ${RENDER_TIMEOUT_S}s). Check the [Ducky dashboard](https://tryducky.dev) for the result.`,
-        "",
-        '<sub>Auto-generated by <a href="https://tryducky.dev">Ducky</a>.</sub>',
-      ].join("\n"),
-      { bestEffort: true },
-    );
-    console.log(posted
-      ? `Ducky: render ${sub.id} still running at render-timeout (${RENDER_TIMEOUT_S}s); left a note, check the dashboard for the result.`
-      : `Ducky: render ${sub.id} still running at render-timeout (${RENDER_TIMEOUT_S}s); could not post the note (does the workflow grant 'permissions: pull-requests: write'?). Check the dashboard for the result.`);
-    process.exit(0);
-  }
-  // 3) post the comment the server composed for this row: identical builders
-  // to the App path, so held renders get the held note (and no video link),
-  // failures get the failure note, and verified demos get the full body.
-  const comment = await fetchComposedComment(sub.id);
-  if (!comment) {
-    // The render is terminal but its comment can't be had; exit honestly by
-    // render status rather than inventing a body client-side. A skipped
-    // render is green everywhere else, so it is green here too.
-    console.log(`Ducky: could not fetch the composed comment for ${sub.id}; no comment posted. See the dashboard.`);
-    if (!DONE.includes(final.status) && final.status !== "skipped") fail(`render ${final.status}`);
-    process.exit(0);
-  }
-  if (comment.post && typeof comment.body === "string" && comment.body) {
-    await postComment(comment.body);
-    console.log(`Ducky: posted the ${comment.outcome} comment to PR #${PR}`);
-  } else {
-    console.log(`Ducky: ${comment.outcome}; nothing to post.`);
-  }
-  if (comment.outcome === "failed") fail(`render failed; details are on the PR and the dashboard`);
+  // One call. The server decides whether the App or this run owns the output.
+  console.log(`Ducky: rendering ${URL_}`);
+  const { renderId, mode, prNumber } = await triggerRender(sha, content);
+  if (mode === "app") await awaitAppComment(renderId, prNumber);
+  else await renderAndComment(renderId);
 }
 
 main().catch((e) => fail(e?.message ?? String(e)));
